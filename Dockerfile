@@ -1,11 +1,14 @@
 # 构建后仅保留运行文件，减少部署镜像中的无用内容。
-FROM golang:1.26-bookworm AS build
+# 编译阶段固定使用构建机架构，避免 ARM64 镜像构建时通过 QEMU 编译 Go。
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY *.go ./
 COPY web ./web
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/adobe2api .
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/adobe2api .
 
 FROM debian:bookworm-slim
 # 浏览器仅在账号刷新与上游请求期间使用，其依赖由安装程序统一处理。

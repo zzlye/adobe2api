@@ -13,6 +13,11 @@ permissions:
   contents: read
   packages: write
 
+# 新提交到同一分支时终止旧构建，避免首次多架构构建排队占用资源。
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Go 校验
