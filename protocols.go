@@ -44,22 +44,12 @@ func validateInput(input *GenerateInput) error {
 	if input.Quality == "" {
 		input.Quality = "auto"
 	}
-	if !hasString([]string{"auto", "low", "medium", "high"}, input.Quality) {
-		return errors.New("画质应为 auto、low、medium 或 high")
-	}
 	ratio, resolution, _, _, err := adobeParameters(model, *input)
 	if err != nil {
 		return err
 	}
 	input.AspectRatio, input.Resolution = ratio, resolution
-	limit := 6
-	if model.Version == "nano-banana" {
-		limit = 4
-	}
-	if len(input.References) > limit {
-		return fmt.Errorf("所选模型最多支持 %d 张参考图", limit)
-	}
-	return nil
+	return validateModelOptions(model, *input)
 }
 
 func decodeProtocolJSON(w http.ResponseWriter, r *http.Request, value any) error {
@@ -92,11 +82,51 @@ func (a *App) imageURL(r *http.Request, image ImageRecord) string {
 	return base + "/images/" + url.PathEscape(image.ID)
 }
 
+// resolveMask 与参考图使用相同的 URL 安全检查和流式落盘流程。
+func (a *App) resolveMask(r *http.Request, input *GenerateInput) error {
+	if len(input.Mask) == 0 || string(input.Mask) == "null" {
+		input.Mask = nil
+		return nil
+	}
+	if input.MaskReference != nil {
+		return errors.New("mask 与 mask_reference 不能同时提供")
+	}
+	var raw string
+	if json.Unmarshal(input.Mask, &raw) != nil {
+		return errors.New("mask 应为图片 URL 或 Data URL")
+	}
+	input.Mask = nil
+	model, ok := resolveModel(input.Model)
+	if !ok || !model.SupportsMask {
+		return errors.New("该模型不支持遮罩编辑")
+	}
+	image, err := a.referenceURL(r, raw)
+	if err != nil {
+		return err
+	}
+	input.MaskReference = &image
+	return nil
+}
+
 func (a *App) canonicalReferences(input *GenerateInput) error {
-	if len(input.References) > 6 {
-		return errors.New("最多支持 6 张参考图")
+	if len(input.Mask) > 0 && string(input.Mask) != "null" {
+		return errors.New("遮罩尚未解析")
+	}
+	if input.MaskReference != nil {
+		image, err := a.store.Image(input.MaskReference.ID)
+		if err != nil || image.Deleted {
+			return errors.New("遮罩不存在或已清理")
+		}
+		input.MaskReference = &image
+	}
+
+	if len(input.References) > 16 {
+		return errors.New("最多支持 16 张参考图")
 	}
 	var total int64
+	if input.MaskReference != nil {
+		total += input.MaskReference.Bytes
+	}
 	for i, reference := range input.References {
 		image, err := a.store.Image(reference.ID)
 		if err != nil || image.Deleted {
@@ -113,11 +143,14 @@ func (a *App) canonicalReferences(input *GenerateInput) error {
 
 func appendReference(input *GenerateInput, image ImageRecord) error {
 	var total int64 = image.Bytes
+	if input.MaskReference != nil {
+		total += input.MaskReference.Bytes
+	}
 	for _, reference := range input.References {
 		total += reference.Bytes
 	}
-	if len(input.References) >= 6 || total > protocolBodyLimit {
-		return errors.New("最多支持 6 张参考图，合计不能超过 64 MB")
+	if len(input.References) >= 16 || total > protocolBodyLimit {
+		return errors.New("最多支持 16 张参考图，合计不能超过 64 MB")
 	}
 	input.References = append(input.References, image)
 	return nil
@@ -327,6 +360,10 @@ func (a *App) adminGenerate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	if err := a.resolveMask(r, &input); err != nil {
+		writeError(w, 400, safeError(err))
+		return
+	}
 	if err := a.canonicalReferences(&input); err != nil {
 		writeError(w, 400, err.Error())
 		return
@@ -346,7 +383,7 @@ func (a *App) adminGenerate(w http.ResponseWriter, r *http.Request) {
 func (a *App) openAIModels(w http.ResponseWriter, r *http.Request) {
 	items := make([]map[string]any, 0, len(availableModels))
 	for _, model := range availableModels {
-		items = append(items, map[string]any{"id": model.ID, "object": "model", "created": 0, "owned_by": "adobe", "name": model.Name})
+		items = append(items, map[string]any{"id": model.ID, "object": "model", "created": 0, "owned_by": "adobe", "name": model.Name, "capabilities": model})
 	}
 	writeJSON(w, 200, map[string]any{"object": "list", "data": items})
 }
@@ -366,7 +403,6 @@ type imageProtocolInput struct {
 	ResponseFormat string          `json:"response_format"`
 	Images         []imageURLInput `json:"images"`
 	Image          json.RawMessage `json:"image"`
-	Mask           json.RawMessage `json:"mask"`
 	OutputFormat   string          `json:"output_format"`
 }
 
@@ -375,11 +411,11 @@ func (a *App) imageJSON(w http.ResponseWriter, r *http.Request) (imageProtocolIn
 	if err := decodeProtocolJSON(w, r, &input); err != nil {
 		return input, err
 	}
-	if len(input.Mask) > 0 && string(input.Mask) != "null" {
-		return input, errors.New("当前模型不支持遮罩编辑")
-	}
 	if input.OutputFormat != "" {
 		return input, errors.New("当前接口不支持指定输出文件格式")
+	}
+	if err := a.resolveMask(r, &input.GenerateInput); err != nil {
+		return input, err
 	}
 	if err := a.canonicalReferences(&input.GenerateInput); err != nil {
 		return input, err
@@ -393,8 +429,8 @@ func (a *App) imageJSON(w http.ResponseWriter, r *http.Request) (imageProtocolIn
 	}
 	// 原始 JSON 编码已转换为地址列表，尽早解除较大的 RawMessage 引用。
 	input.Image = nil
-	if len(input.Images)+len(input.References) > 6 {
-		return input, errors.New("最多支持 6 张参考图")
+	if len(input.Images)+len(input.References) > 16 {
+		return input, errors.New("最多支持 16 张参考图")
 	}
 	for index, reference := range input.Images {
 		image, err := a.referenceURL(r, reference.ImageURL)
@@ -468,18 +504,27 @@ func (a *App) imageMultipart(w http.ResponseWriter, r *http.Request) (imageProto
 			return input, errors.New("图片编辑请求无效或超过 64 MB")
 		}
 		name := part.FormName()
-		if name == "mask" {
-			part.Close()
-			return input, errors.New("当前模型不支持遮罩编辑")
-		}
 		if part.FileName() != "" {
+			if name == "mask" {
+				if input.MaskReference != nil {
+					part.Close()
+					return input, errors.New("最多支持一张遮罩")
+				}
+				image, err := a.saveReference(part, part.Header.Get("Content-Type"))
+				part.Close()
+				if err != nil {
+					return input, err
+				}
+				input.MaskReference = &image
+				continue
+			}
 			if name != "image" && name != "image[]" {
 				part.Close()
 				return input, errors.New("参考图文件字段应为 image 或 image[]")
 			}
-			if len(input.References) >= 6 {
+			if len(input.References) >= 16 {
 				part.Close()
-				return input, errors.New("最多支持 6 张参考图")
+				return input, errors.New("最多支持 16 张参考图")
 			}
 			image, err := a.saveReference(part, part.Header.Get("Content-Type"))
 			part.Close()
@@ -510,6 +555,34 @@ func (a *App) imageMultipart(w http.ResponseWriter, r *http.Request) (imageProto
 			input.Resolution = value
 		case "quality":
 			input.Quality = value
+		case "background":
+			input.Background = value
+		case "detail_level":
+			var number int
+			number, err = strconv.Atoi(value)
+			input.DetailLevel = &number
+		case "seed":
+			var number int64
+			number, err = strconv.ParseInt(value, 10, 64)
+			input.Seed = &number
+		case "seeds":
+			err = json.Unmarshal(content, &input.Seeds)
+		case "reference_usages":
+			err = json.Unmarshal(content, &input.ReferenceUsages)
+		case "ground_search", "transparent_background":
+			var flag bool
+			flag, err = strconv.ParseBool(value)
+			if name == "ground_search" {
+				input.GroundSearch = &flag
+			} else {
+				input.TransparentBackground = &flag
+			}
+		case "model_specific_payload":
+			err = json.Unmarshal(content, &input.ModelSpecificPayload)
+		case "output":
+			err = json.Unmarshal(content, &input.Output)
+		case "mask":
+			return input, errors.New("遮罩应上传为文件")
 		case "response_format":
 			input.ResponseFormat = value
 		case "n":
@@ -523,6 +596,9 @@ func (a *App) imageMultipart(w http.ResponseWriter, r *http.Request) (imageProto
 			}
 		case "image", "image[]":
 			return input, errors.New("参考图应上传为文件")
+		}
+		if err != nil {
+			return input, fmt.Errorf("参数 %s 无效", name)
 		}
 	}
 	return input, nil
@@ -660,8 +736,12 @@ func (a *App) openAIChat(w http.ResponseWriter, r *http.Request) {
 	// 完成内容提取后清空原消息，后续响应闭包只使用规范化提示词和模型信息。
 	request.Messages = nil
 	texts = nil
-	if len(references)+len(request.References) > 6 {
-		writeError(w, 400, "最多支持 6 张参考图")
+	if len(references)+len(request.References) > 16 {
+		writeError(w, 400, "最多支持 16 张参考图")
+		return
+	}
+	if err := a.resolveMask(r, &request.GenerateInput); err != nil {
+		writeError(w, 400, safeError(err))
 		return
 	}
 	if err := a.canonicalReferences(&request.GenerateInput); err != nil {
@@ -803,6 +883,10 @@ type geminiPart struct {
 	} `json:"fileData"`
 }
 type geminiProtocolInput struct {
+	GenerateInput
+	Tools []struct {
+		GoogleSearch *json.RawMessage `json:"googleSearch"`
+	} `json:"tools"`
 	Contents []struct {
 		Role  string       `json:"role"`
 		Parts []geminiPart `json:"parts"`
@@ -811,11 +895,18 @@ type geminiProtocolInput struct {
 		Parts []geminiPart `json:"parts"`
 	} `json:"systemInstruction"`
 	GenerationConfig struct {
+		Seed               *int64   `json:"seed"`
 		CandidateCount     int      `json:"candidateCount"`
 		ResponseModalities []string `json:"responseModalities"`
 		ImageConfig        struct {
-			AspectRatio string `json:"aspectRatio"`
-			ImageSize   string `json:"imageSize"`
+			Quality               string   `json:"quality"`
+			Background            string   `json:"background"`
+			DetailLevel           *int     `json:"detailLevel"`
+			TransparentBackground *bool    `json:"transparentBackground"`
+			Size                  string   `json:"size"`
+			AspectRatio           string   `json:"aspectRatio"`
+			ImageSize             string   `json:"imageSize"`
+			ReferenceUsages       []string `json:"referenceUsages"`
 		} `json:"imageConfig"`
 	} `json:"generationConfig"`
 }
@@ -840,7 +931,59 @@ func (a *App) geminiGenerate(w http.ResponseWriter, r *http.Request) {
 		writeGeminiError(w, 400, "当前接口用于图片生成，请包含 IMAGE 响应类型")
 		return
 	}
-	input := GenerateInput{Model: model, N: request.GenerationConfig.CandidateCount, AspectRatio: request.GenerationConfig.ImageConfig.AspectRatio, Resolution: request.GenerationConfig.ImageConfig.ImageSize}
+	input := request.GenerateInput
+	input.Model = model
+	config := request.GenerationConfig
+	if config.CandidateCount != 0 {
+		input.N = config.CandidateCount
+	}
+	if config.Seed != nil {
+		input.Seed = config.Seed
+	}
+	if config.ImageConfig.AspectRatio != "" {
+		input.AspectRatio = config.ImageConfig.AspectRatio
+	}
+	if config.ImageConfig.ImageSize != "" {
+		input.Resolution = config.ImageConfig.ImageSize
+	}
+	if config.ImageConfig.Quality != "" {
+		input.Quality = config.ImageConfig.Quality
+	}
+	if config.ImageConfig.Background != "" {
+		input.Background = config.ImageConfig.Background
+	}
+	if config.ImageConfig.Size != "" {
+		input.Size = config.ImageConfig.Size
+	}
+	if config.ImageConfig.DetailLevel != nil {
+		input.DetailLevel = config.ImageConfig.DetailLevel
+	}
+	if config.ImageConfig.TransparentBackground != nil {
+		input.TransparentBackground = config.ImageConfig.TransparentBackground
+	}
+	if len(config.ImageConfig.ReferenceUsages) > 0 {
+		input.ReferenceUsages = config.ImageConfig.ReferenceUsages
+	}
+	for _, tool := range request.Tools {
+		if tool.GoogleSearch == nil {
+			writeGeminiError(w, 400, "仅支持 googleSearch 工具")
+			return
+		}
+		if input.GroundSearch != nil && !*input.GroundSearch {
+			writeGeminiError(w, 400, "googleSearch 与 ground_search 冲突")
+			return
+		}
+		enabled := true
+		input.GroundSearch = &enabled
+	}
+	if err := a.resolveMask(r, &input); err != nil {
+		writeGeminiError(w, 400, safeError(err))
+		return
+	}
+	if err := a.canonicalReferences(&input); err != nil {
+		writeGeminiError(w, 400, safeError(err))
+		return
+	}
 	texts := []string{}
 	parts := []geminiPart{}
 	if request.SystemInstruction != nil {
@@ -860,8 +1003,8 @@ func (a *App) geminiGenerate(w http.ResponseWriter, r *http.Request) {
 			texts = append(texts, part.Text)
 		}
 		if part.InlineData != nil || part.FileData != nil {
-			if len(input.References) >= 6 {
-				writeGeminiError(w, 400, "最多支持 6 张参考图")
+			if len(input.References) >= 16 {
+				writeGeminiError(w, 400, "最多支持 16 张参考图")
 				return
 			}
 			var image ImageRecord

@@ -246,19 +246,40 @@ function updateModelOptions() {
   const previous = select.value;
   select.replaceChildren(...resolutions.map(value => el('option', { value, text: value })));
   if (resolutions.includes(previous)) select.value = previous;
+  const qualities = model?.qualities || ['auto'];
+  const quality = $('#generate-quality');
+  const previousQuality = quality.value;
+  const labels = { auto: '自动', low: '快速', medium: '标准', high: '高', max: '最高' };
+  quality.replaceChildren(...qualities.map(value => el('option', { value, text: labels[value] || value })));
+  if (qualities.includes(previousQuality)) quality.value = previousQuality;
+  $('#quality-field').hidden = qualities.length <= 1;
+  $('#background-field').hidden = !model?.supports_transparency;
+  $('#seed-field').hidden = !model?.supports_seed;
+  $('#search-field').hidden = !model?.supports_ground_search;
+  $('#detail-field').hidden = !model?.max_detail_level;
+  $('#generate-detail').max = model?.max_detail_level || 1;
+  $('#generate-detail').value = '';
   updateRatioOptions();
+  renderReferences();
 }
 function updateRatioOptions() {
   const model = state.models.find(item => item.id === $('#generate-model').value);
   let ratios = model?.ratios?.length ? model.ratios : ['1:1', '16:9', '9:16', '4:3', '3:4'];
   // 部分模型的大图请求必须指定比例，按模型能力联动选项，不提交无效的自动比例。
   if (model?.high_resolution_requires_ratio && ['2K', '4K'].includes($('#generate-resolution').value)) ratios = ratios.filter(value => value !== 'auto');
+  if (model?.supports_custom_size) ratios = [...ratios, 'custom'];
   const select = $('#generate-ratio');
   const previous = select.value;
-  select.replaceChildren(...ratios.map(value => el('option', { value, text: value === 'auto' ? '自动' : value })));
+  select.replaceChildren(...ratios.map(value => el('option', { value, text: value === 'auto' ? '自动' : value === 'custom' ? '自定义' : value })));
   if (ratios.includes(previous)) select.value = previous;
   else if (previous === 'auto' && ratios.includes('1:1')) select.value = '1:1';
+  updateCustomRatio();
 }
+function updateCustomRatio() {
+  $('#custom-ratio-field').hidden = $('#generate-ratio').value !== 'custom';
+}
+function referenceLimit() { return state.models.find(item => item.id === $('#generate-model').value)?.max_references || 14; }
+function referenceByteLimit() { return Number(state.models.find(item => item.id === $('#generate-model').value)?.max_reference_bytes || 20 * 1024 ** 2); }
 
 function renderStats(stats) {
   const cards = [
@@ -504,7 +525,7 @@ async function loadSettings(displayError = true) {
     state.settings = data;
     state.settingsDirty = false;
     const form = $('#settings-form');
-    for (const field of ['public_url', 'proxy_url', 'admin_username', 'refresh_minutes', 'retention_hours', 'max_storage_mb', 'max_concurrent', 'request_timeout_seconds', 'log_retention_days']) form.elements[field].value = data[field] ?? '';
+    for (const field of ['public_url', 'proxy_url', 'admin_username', 'account_strategy', 'refresh_minutes', 'retention_hours', 'max_storage_mb', 'max_concurrent', 'request_timeout_seconds', 'log_retention_days']) form.elements[field].value = data[field] ?? (field === 'account_strategy' ? 'round_robin' : '');
     form.elements.password.value = '';
     $('#api-key-list').replaceChildren();
     (data.api_keys || []).forEach(key => addKey(key));
@@ -543,8 +564,8 @@ function clearReferences() {
   renderReferences();
 }
 function renderReferences() {
-  $('#reference-count').textContent = `${state.references.length} / 6`;
-  $('#reference-upload').hidden = state.references.length >= 6;
+  $('#reference-count').textContent = `${state.references.length} / ${referenceLimit()}`;
+  $('#reference-upload').hidden = state.references.length >= referenceLimit();
   $('#references').replaceChildren(...state.references.map(reference => el('div', { class: 'reference-item' }, el('img', { src: reference.objectURL || safeURL(reference.image?.url), alt: reference.name || '参考图', decoding: 'async' }), reference.uploading ? el('span', { class: 'spinner' }) : null, el('button', { type: 'button', 'aria-label': '移除参考图', disabled: state.generating, onclick: () => {
     reference.controller?.abort();
     if (reference.objectURL) URL.revokeObjectURL(reference.objectURL);
@@ -554,11 +575,11 @@ function renderReferences() {
 }
 async function uploadReferences(files) {
   if (state.generating) return;
-  const available = 6 - state.references.length;
-  if (files.length > available) toast('最多添加 6 张参考图', true);
+  const available = Math.max(0, referenceLimit() - state.references.length);
+  if (files.length > available) toast('参考图数量已达上限', true);
   for (const file of Array.from(files).slice(0, available)) {
     if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) { toast('请选择 PNG、JPG 或 WebP 图片', true); continue; }
-    if (file.size > 20 * 1024 ** 2) { toast('单张参考图不能超过 20 MB', true); continue; }
+    if (file.size > referenceByteLimit()) { toast(`单张参考图不能超过 ${bytes(referenceByteLimit())}`, true); continue; }
     const reference = { name: file.name, objectURL: URL.createObjectURL(file), uploading: true, controller: new AbortController() };
     state.references.push(reference);
     renderReferences();
@@ -689,7 +710,7 @@ $('#settings-form').addEventListener('submit', async event => {
   event.preventDefault();
   const form = event.currentTarget;
   const body = {};
-  for (const key of ['public_url', 'proxy_url', 'admin_username']) body[key] = form.elements[key].value.trim();
+  for (const key of ['public_url', 'proxy_url', 'admin_username', 'account_strategy']) body[key] = form.elements[key].value.trim();
   for (const key of ['refresh_minutes', 'retention_hours', 'max_storage_mb', 'max_concurrent', 'request_timeout_seconds', 'log_retention_days']) body[key] = Number(form.elements[key].value);
   body.api_keys = [...new Set($$('#api-key-list input').map(input => input.value.trim()).filter(Boolean))];
   if (form.elements.password.value) body.password = form.elements.password.value;
@@ -715,6 +736,7 @@ $('#cleanup').addEventListener('click', async () => {
 });
 $('#generate-model').addEventListener('change', updateModelOptions);
 $('#generate-resolution').addEventListener('change', updateRatioOptions);
+$('#generate-ratio').addEventListener('change', updateCustomRatio);
 $('#reference-input').addEventListener('change', event => { const files = Array.from(event.target.files || []); event.target.value = ''; uploadReferences(files); });
 $('#reference-upload').addEventListener('dragover', event => { event.preventDefault(); });
 $('#reference-upload').addEventListener('drop', event => { event.preventDefault(); if (event.dataTransfer?.files) uploadReferences(Array.from(event.dataTransfer.files)); });
@@ -726,6 +748,22 @@ $('#generate-form').addEventListener('submit', async event => {
   const prompt = $('#generate-prompt').value.trim();
   if (!prompt) { $('#generate-prompt').focus(); return; }
   const body = { model: $('#generate-model').value, prompt, n: Number($('#generate-count').value), aspect_ratio: $('#generate-ratio').value, resolution: $('#generate-resolution').value, quality: $('#generate-quality').value, references: state.references.filter(reference => reference.image).map(reference => reference.image) };
+  const model = state.models.find(item => item.id === body.model);
+  if (body.references.length > referenceLimit()) { toast(`该模型最多支持 ${referenceLimit()} 张参考图`, true); return; }
+  if (body.aspect_ratio === 'custom') {
+    body.aspect_ratio = $('#generate-custom-ratio').value.trim();
+    body.size = $('#generate-size').value.trim();
+    if (!body.aspect_ratio && !body.size) { toast('请输入比例或尺寸', true); return; }
+    // 精确尺寸独立决定输出，避免默认分辨率和用户指定尺寸冲突。
+    if (body.size) delete body.resolution;
+  }
+  if (model?.supports_transparency) body.background = $('#generate-background').value;
+  if (model?.supports_ground_search) body.ground_search = $('#generate-search').value === 'true';
+  if (model?.supports_seed && $('#generate-seed').value !== '') {
+    body.seed = Number($('#generate-seed').value);
+    if (!Number.isSafeInteger(body.seed)) { toast('种子超出可输入范围', true); return; }
+  }
+  if (model?.max_detail_level && $('#generate-detail').value !== '') { body.detail_level = Number($('#generate-detail').value); body.quality = 'auto'; }
   $('#generate-error').hidden = true;
   setGenerating(true);
   state.generationController = new AbortController();

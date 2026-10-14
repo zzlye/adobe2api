@@ -88,7 +88,7 @@ func TestAdobeModelTemplates(t *testing.T) {
 	if _, exists := body["size"]; exists || body["modelSpecificPayload"].(map[string]any)["size"] != "auto" {
 		t.Fatalf("GPT 自动尺寸应省略输出宽高：%v", body)
 	}
-	if body["generationSettings"].(map[string]int)["detailLevel"] != 5 {
+	if body["generationSettings"].(map[string]any)["detailLevel"] != 5 {
 		t.Fatal("高画质应转换为 detailLevel 5")
 	}
 	pro, _ := resolveModel("nano-banana-pro")

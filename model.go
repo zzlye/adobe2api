@@ -17,6 +17,7 @@ type Settings struct {
 	RetentionHours        int      `json:"retention_hours"`
 	MaxStorageMB          int64    `json:"max_storage_mb"`
 	MaxConcurrent         int      `json:"max_concurrent"`
+	AccountStrategy       string   `json:"account_strategy"`
 	RequestTimeoutSeconds int      `json:"request_timeout_seconds"`
 	LogRetentionDays      int      `json:"log_retention_days"`
 }
@@ -102,17 +103,47 @@ type Model struct {
 	Ratios                      []string `json:"ratios"`
 	Resolutions                 []string `json:"resolutions"`
 	HighResolutionRequiresRatio bool     `json:"high_resolution_requires_ratio,omitempty"`
+	Qualities                   []string `json:"qualities"`
+	MaxDetailLevel              int      `json:"max_detail_level,omitempty"`
+	SupportsTransparency        bool     `json:"supports_transparency"`
+	SupportsCustomSize          bool     `json:"supports_custom_size"`
+	SupportsGroundSearch        bool     `json:"supports_ground_search"`
+	SupportsSeed                bool     `json:"supports_seed"`
+	SupportsMask                bool     `json:"supports_mask"`
+	MaxReferences               int      `json:"max_references"`
+	MaxReferenceBytes           int64    `json:"max_reference_bytes"`
+	ReferenceUsages             []string `json:"reference_usages"`
 }
 
 type GenerateInput struct {
-	Model       string        `json:"model"`
-	Prompt      string        `json:"prompt"`
-	N           int           `json:"n"`
-	Size        string        `json:"size"`
-	AspectRatio string        `json:"aspect_ratio"`
-	Resolution  string        `json:"resolution"`
-	Quality     string        `json:"quality"`
-	References  []ImageRecord `json:"references"`
+	Model                 string          `json:"model"`
+	Prompt                string          `json:"prompt"`
+	N                     int             `json:"n"`
+	Size                  string          `json:"size"`
+	AspectRatio           string          `json:"aspect_ratio"`
+	Resolution            string          `json:"resolution"`
+	Quality               string          `json:"quality"`
+	References            []ImageRecord   `json:"references"`
+	ReferenceUsages       []string        `json:"reference_usages,omitempty"`
+	Background            string          `json:"background,omitempty"`
+	TransparentBackground *bool           `json:"transparent_background,omitempty"`
+	DetailLevel           *int            `json:"detail_level,omitempty"`
+	Seed                  *int64          `json:"seed,omitempty"`
+	Seeds                 []int64         `json:"seeds,omitempty"`
+	GroundSearch          *bool           `json:"ground_search,omitempty"`
+	Mask                  json.RawMessage `json:"mask,omitempty"`
+	MaskReference         *ImageRecord    `json:"mask_reference,omitempty"`
+	ModelSpecificPayload  map[string]any  `json:"model_specific_payload,omitempty"`
+	Output                *AdobeOutput    `json:"output,omitempty"`
+}
+
+// AdobeOutput 仅暴露模型目录声明的输出保存选项。
+type AdobeOutput struct {
+	StoreInputs  bool `json:"storeInputs"`
+	TargetFolder *struct {
+		CreativeCloudProjectID string `json:"creativeCloudProjectId,omitempty"`
+		CreativeCloudPath      string `json:"creativeCloudPath,omitempty"`
+	} `json:"targetFolder,omitempty"`
 }
 
 type GenerateResult struct {

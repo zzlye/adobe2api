@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -160,6 +161,18 @@ func (a *App) reserveAccount() (Account, func(), error) {
 	if a.busy == nil {
 		a.busy = make(map[string]bool)
 	}
+	// 先从全部空闲启用账号中均匀抽样，不能随机起点后顺延造成权重偏差。
+	if a.store.Settings().AccountStrategy == "random" {
+		candidates := make([]int, 0, len(accounts))
+		for i, account := range accounts {
+			if account.Enabled && !a.busy[account.ID] {
+				candidates = append(candidates, i)
+			}
+		}
+		if len(candidates) > 0 {
+			a.next = candidates[rand.IntN(len(candidates))]
+		}
+	}
 	for i := 0; i < len(accounts); i++ {
 		index := (a.next + i) % len(accounts)
 		account := accounts[index]
@@ -179,8 +192,8 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 		release()
 	}
 	started := time.Now()
-	entry := RequestLog{ID: newID(), CreatedAt: started, Protocol: protocol, Endpoint: endpoint, Model: input.Model, Prompt: input.Prompt, Status: "failed", HTTPStatus: 502, Images: []ImageRecord{}, References: input.References, Upstream: []UpstreamRecord{}}
-	entry.Parameters, _ = json.Marshal(map[string]any{"n": input.N, "size": input.Size, "aspect_ratio": input.AspectRatio, "resolution": input.Resolution, "quality": input.Quality})
+	entry := RequestLog{ID: newID(), CreatedAt: started, Protocol: protocol, Endpoint: endpoint, Model: input.Model, Prompt: input.Prompt, Status: "failed", HTTPStatus: 502, Images: []ImageRecord{}, References: input.allReferences(), Upstream: []UpstreamRecord{}}
+	entry.Parameters = input.parameterJSON()
 	finish := func(result GenerateResult, err error) (GenerateResult, RequestLog, error) {
 		entry.FinishedAt = time.Now()
 		entry.DurationMS = entry.FinishedAt.Sub(started).Milliseconds()
@@ -208,7 +221,7 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 		return finish(GenerateResult{}, err)
 	}
 	entry.Model = input.Model
-	entry.Parameters, _ = json.Marshal(map[string]any{"n": input.N, "size": input.Size, "aspect_ratio": input.AspectRatio, "resolution": input.Resolution, "quality": input.Quality})
+	entry.Parameters = input.parameterJSON()
 	account, release, err := a.reserveAccount()
 	if err != nil {
 		entry.HTTPStatus = 503
@@ -220,7 +233,7 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(a.store.Settings().RequestTimeoutSeconds)*time.Second)
 	defer cancel()
 	ctx = context.WithValue(ctx, requestLogContextKey{}, &entry)
-	unpin := a.store.PinImages(input.References)
+	unpin := a.store.PinImages(input.allReferences())
 	defer unpin()
 	if account.AccessToken == "" || account.UserID == "" || account.Status == "pending" || account.Status == "expired" || (!account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) < time.Minute) {
 		refreshed, err := a.generator.Refresh(ctx, account)

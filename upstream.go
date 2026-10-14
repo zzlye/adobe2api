@@ -364,8 +364,8 @@ func (g *AdobeGenerator) uploadReference(ctx context.Context, client *http.Clien
 	}
 	defer file.Close()
 	stat, err := file.Stat()
-	if err != nil || stat.Size() == 0 || stat.Size() > 48<<20 {
-		return "", errors.New("参考图为空或超过 Adobe 的 48 MB 上传限制")
+	if err != nil || stat.Size() == 0 || stat.Size() > maxImageBytes {
+		return "", errors.New("参考图为空或超过 64 MB 上传限制")
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, adobeUpstreamURL+"/v2/storage/image", file)
 	if err != nil {
@@ -469,7 +469,7 @@ func adobeSizeResolution(model Model, width, height int) string {
 	return "1K"
 }
 
-// adobeParameters 由协议校验与实际生成共用，明确尺寸优先推断比例并验证上游硬限制。
+// adobeParameters 按模型目录校验尺寸，自定义比例计算结果仍遵守上游像素约束。
 func adobeParameters(model Model, input GenerateInput) (string, string, int, int, error) {
 	ratio, resolution := strings.TrimSpace(input.AspectRatio), strings.ToUpper(strings.TrimSpace(input.Resolution))
 	width, height := 0, 0
@@ -479,21 +479,39 @@ func adobeParameters(model Model, input GenerateInput) (string, string, int, int
 		if err != nil {
 			return "", "", 0, 0, err
 		}
-		if model.AdobeID == "gpt-image" && (width > adobeGPTMaxEdge || height > adobeGPTMaxEdge || int64(width)*int64(height) > adobeGPTMaxPixels) {
-			return "", "", 0, 0, errors.New("GPT 图片最长边不能超过 3840 像素，总像素不能超过 8294400")
-		}
 		best := closestAdobeRatio(width, height, model.Ratios)
+		if model.SupportsCustomSize {
+			if err := validGPTSize(width, height); err != nil {
+				return "", "", 0, 0, err
+			}
+			if ratio != "" && ratio != "auto" {
+				r, err := ratioNumber(ratio)
+				if err != nil || math.Abs(math.Log(float64(width)/float64(height)/r)) > 0.035 {
+					return "", "", 0, 0, errors.New("尺寸与画面比例不一致")
+				}
+				best = ratio
+			} else if best == "" {
+				best = fmt.Sprintf("%d:%d", width, height)
+			}
+		}
+		if model.Version == "1.5" && !((width == 1024 && height == 1024) || (width == 1536 && height == 1024) || (width == 1024 && height == 1536)) {
+			return "", "", 0, 0, errors.New("GPT Image 1.5 仅支持 1024x1024、1536x1024、1024x1536")
+		}
 		if best == "" {
 			return "", "", 0, 0, errors.New("该模型不支持请求的图片比例")
 		}
 		if ratio != "" && ratio != "auto" && ratio != best {
 			return "", "", 0, 0, errors.New("尺寸与画面比例不一致")
 		}
-		inferredResolution := adobeSizeResolution(model, width, height)
-		if resolution != "" && resolution != inferredResolution {
+		inferred := adobeSizeResolution(model, width, height)
+		// 香蕉的显式分辨率直接决定输出档位，size 只用于推断比例。
+		if resolution != "" && resolution != inferred && model.AdobeID != "gemini-flash" {
 			return "", "", 0, 0, errors.New("尺寸与分辨率档位不一致")
 		}
-		ratio, resolution = best, inferredResolution
+		ratio = best
+		if resolution == "" {
+			resolution = inferred
+		}
 	}
 	if ratio == "" {
 		if hasString(model.Ratios, "auto") {
@@ -505,57 +523,86 @@ func adobeParameters(model Model, input GenerateInput) (string, string, int, int
 	if resolution == "" {
 		resolution = "1K"
 	}
-	if !hasString(model.Ratios, ratio) {
-		return "", "", 0, 0, errors.New("该模型不支持指定的图片比例")
-	}
 	if !hasString(model.Resolutions, resolution) {
 		return "", "", 0, 0, errors.New("该模型不支持指定的分辨率")
 	}
+	if !hasString(model.Ratios, ratio) {
+		if !model.SupportsCustomSize {
+			return "", "", 0, 0, errors.New("该模型不支持指定的图片比例")
+		}
+		if _, err := ratioNumber(ratio); err != nil {
+			return "", "", 0, 0, err
+		}
+		if width == 0 {
+			var err error
+			width, height, err = customGPTSize(ratio, resolution)
+			if err != nil {
+				return "", "", 0, 0, err
+			}
+		}
+	}
 	if model.HighResolutionRequiresRatio && resolution != "1K" && ratio == "auto" {
-		// 高分辨率的自动模式尚未获得有效输出，不能省略尺寸后静默退回默认档位。
 		return "", "", 0, 0, errors.New("该模型在 2K、4K 分辨率下需要指定画面比例")
 	}
 	return ratio, resolution, width, height, nil
 }
 
 func adobeGenerationBody(model Model, input GenerateInput, references []map[string]string, seed uint32) (map[string]any, error) {
+	if err := validateModelOptions(model, input); err != nil {
+		return nil, err
+	}
 	ratio, resolution, width, height, err := adobeParameters(model, input)
 	if err != nil {
 		return nil, err
 	}
 	body := map[string]any{
-		"n": 1, "seeds": []uint32{seed}, "prompt": input.Prompt,
+		"n": 1, "prompt": input.Prompt,
 		"output": map[string]any{"storeInputs": false}, "referenceBlobs": references,
 		"modelId": model.AdobeID, "modelVersion": model.Version,
 		"generationMetadata": map[string]string{"module": "text2image", "submodule": "ff-image-generate"},
 	}
+	if input.Output != nil {
+		body["output"] = input.Output
+	}
+	payload := make(map[string]any, len(input.ModelSpecificPayload)+2)
+	for key, value := range input.ModelSpecificPayload {
+		payload[key] = value
+	}
+	body["modelSpecificPayload"] = payload
 	if model.AdobeID == "gemini-flash" {
 		size := map[string]int{"512": 512, "1K": 1024, "2K": 2048, "4K": 4096}[resolution]
-		payload := map[string]any{"parameters": map[string]bool{"addWatermark": false}}
+		if _, exists := payload["parameters"]; !exists {
+			payload["parameters"] = map[string]bool{"addWatermark": false}
+		}
 		if ratio != "auto" {
 			payload["aspectRatio"] = ratio
+			body["generationSettings"] = map[string]any{"aspectRatio": ratio}
 		}
 		body["size"] = map[string]int{"width": size, "height": size}
-		if model.Version == "nano-banana" {
-			// 旧版香蕉按页面定义的实际图片尺寸提交，不使用高分辨率档位。
-			sizes := map[string][2]int{"1:1": {1024, 1024}, "4:3": {1184, 864}, "3:4": {864, 1184}, "16:9": {1344, 768}, "9:16": {768, 1344}, "21:9": {1536, 672}, "3:2": {1248, 832}, "2:3": {832, 1248}, "5:4": {1152, 896}, "4:5": {896, 1152}}
-			actual := sizes[ratio]
-			body["size"] = map[string]int{"width": actual[0], "height": actual[1]}
-		} else {
-			body["groundSearch"] = false
+		body["resolution"] = resolution
+		search := false
+		if input.GroundSearch != nil {
+			search = *input.GroundSearch
 		}
-		body["modelSpecificPayload"] = payload
+		body["groundSearch"] = search
+		value := int64(seed)
+		if input.Seed != nil {
+			value = *input.Seed
+		}
+		if len(input.Seeds) > 0 {
+			value = input.Seeds[0]
+		}
+		body["seeds"] = []int64{value}
 		return body, nil
 	}
 	if model.AdobeID != "gpt-image" {
 		return nil, errors.New("暂不支持该 Adobe 上游模型")
 	}
-	payload := map[string]any{}
 	if ratio == "auto" {
 		payload["size"] = "auto"
 	} else {
 		actual := adobeGPTSizes[ratio]
-		if model.Version != "2" {
+		if model.Version == "1.5" {
 			actual = map[string][2]int{"1:1": {1024, 1024}, "3:2": {1536, 1024}, "2:3": {1024, 1536}}[ratio]
 		}
 		if resolution == "2K" {
@@ -564,23 +611,26 @@ func adobeGenerationBody(model Model, input GenerateInput, references []map[stri
 			actual = adobeGPTSizes4K[ratio]
 		}
 		if width > 0 && height > 0 {
-			// 自定义尺寸由页面原样提交，GPT2.5 同样不能回退到默认 1K。
 			actual = [2]int{width, height}
+		}
+		if model.SupportsCustomSize {
+			if err := validGPTSize(actual[0], actual[1]); err != nil {
+				return nil, err
+			}
 		}
 		body["size"] = map[string]int{"width": actual[0], "height": actual[1]}
 	}
-	body["modelSpecificPayload"] = payload
-	if model.Version != "1.5" {
-		quality := input.Quality
-		if quality == "" || quality == "auto" || quality == "standard" {
-			quality = "medium"
-		}
-		detail := map[string]int{"low": 1, "medium": 3, "high": 5}[quality]
-		if detail == 0 {
-			return nil, errors.New("该模型画质仅支持 low、medium、high")
-		}
-		body["generationSettings"] = map[string]int{"detailLevel": detail}
+	detail := qualityDetail(model, input.Quality)
+	if input.DetailLevel != nil {
+		detail = *input.DetailLevel
 	}
+	settings := map[string]any{"detailLevel": detail}
+	if input.TransparentBackground != nil {
+		settings["transparentBackground"] = *input.TransparentBackground
+	} else if input.Background != "" && input.Background != "auto" {
+		settings["transparentBackground"] = input.Background == "transparent"
+	}
+	body["generationSettings"] = settings
 	return body, nil
 }
 
@@ -606,15 +656,8 @@ func (g *AdobeGenerator) Generate(ctx context.Context, account Account, input Ge
 	if count == 0 {
 		count = 1
 	}
-	if count < 1 || count > 10 {
-		return result, errors.New("生成数量应在 1 到 10 之间")
-	}
-	limit := 6
-	if model.Version == "nano-banana" {
-		limit = 4
-	}
-	if len(input.References) > limit {
-		return result, fmt.Errorf("该模型最多支持 %d 张参考图", limit)
+	if count < 1 || count > 4 {
+		return result, errors.New("生成数量应在 1 到 4 之间")
 	}
 	if _, err := adobeGenerationBody(model, input, nil, 0); err != nil {
 		return result, err
@@ -624,16 +667,19 @@ func (g *AdobeGenerator) Generate(ctx context.Context, account Account, input Ge
 		return result, err
 	}
 	references := make([]map[string]string, 0, len(input.References))
-	for _, reference := range input.References {
+	for index, reference := range input.References {
 		id, err := g.uploadReference(ctx, client, account, reference, log)
 		if err != nil {
 			return result, err
 		}
-		usage := "general"
-		if model.AdobeID == "gpt-image" {
-			usage = "subject"
+		references = append(references, map[string]string{"id": id, "usage": referenceUsage(model, input, index)})
+	}
+	if input.MaskReference != nil {
+		id, err := g.uploadReference(ctx, client, account, *input.MaskReference, log)
+		if err != nil {
+			return result, err
 		}
-		references = append(references, map[string]string{"id": id, "usage": usage})
+		references = append(references, map[string]string{"id": id, "usage": "mask"})
 	}
 	// 账号池在一次生成期间独占该账号，以前后余额差记录实际消耗。
 	before := g.readCreditBalance(ctx, client, account, log)
@@ -648,7 +694,12 @@ func (g *AdobeGenerator) Generate(ctx context.Context, account Account, input Ge
 		if _, err := rand.Read(random[:]); err != nil {
 			return result, err
 		}
-		body, err := adobeGenerationBody(model, input, references, binary.BigEndian.Uint32(random[:])&0x7fffffff)
+		single := input
+		if len(input.Seeds) > 0 {
+			single.Seeds = nil
+			single.Seed = &input.Seeds[index]
+		}
+		body, err := adobeGenerationBody(model, single, references, binary.BigEndian.Uint32(random[:])&0x7fffffff)
 		if err != nil {
 			return result, err
 		}

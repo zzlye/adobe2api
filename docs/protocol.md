@@ -16,6 +16,23 @@ Gemini 兼容接口使用 `x-goog-api-key`，也可通过查询参数 `key` 传�
 
 当前香蕉模型为 Nano Banana 2（`gemini-3.1-flash-image-preview`）和 Nano Banana Pro（`gemini-3-pro-image-preview`）。
 
+## 当前 Adobe 模型参数
+
+已核对 [Adobe Firefly Generate Image 文档](https://developer.adobe.com/firefly-services/docs/firefly-api/guides/how-tos/firefly-generate-image-api-tutorial) 和 [内容模型生成文档](https://developer.adobe.com/firefly-services/docs/firefly-api/guides/how-tos/cm-generate-image/feature-guide)，并以 Adobe 网页端在 2026 年 10 月 14 日返回的当前模型 Schema 校验本服务的参数。公开 Firefly API 和网页端合作模型不是同一条模型线路，字段不能直接混用。
+
+服务已映射的通用参数为 `model`、`prompt`、`n`、`size`、`aspect_ratio`、`resolution`、`references`、`reference_usages`、`model_specific_payload`、`output`。其中 `reference_usages` 是与参考图同顺序的字符串数组；`output.storeInputs` 与 `output.targetFolder` 会按上游格式转发；`generationMetadata` 是网页工作流标识，由服务固定填写，不能由客户端覆盖。
+
+| 模型 | 支持的生成参数 | 尺寸、比例与参考图 |
+| --- | --- | --- |
+| Nano Banana 2 | `seed` 或 `seeds`、`ground_search` | `512`、`1K`、`2K`、`4K`；支持 `1:8`、`8:1`、`1:4`、`4:1` 等页面列出的比例；最多 14 张 PNG、JPEG 或 WebP，单张不超过 20 MB；`reference_usages` 可为 `general` 或 `element`。 |
+| Nano Banana Pro | `seed` 或 `seeds`、`ground_search` | `1K`、`2K`、`4K`；最多 14 张 PNG、JPEG 或 WebP，单张不超过 20 MB；`reference_usages` 可为 `general` 或 `element`。 |
+| GPT Image 1.5、2 | `quality`、`detail_level`、`mask` | `quality` 是兼容映射，`low`、`medium`、`high`、`max` 分别映射为上游细节等级；`detail_level` 范围为 1 到 5。最多 16 张参考图；`reference_usages` 可为 `source` 或 `element`，遮罩通过 `mask` 指定。 |
+| GPT Image 2.5 Sunburst、Flare | `quality`、`detail_level`、`background`、`transparent_background`、`mask` | `quality:max` 映射为细节等级 7；`detail_level` 范围为 1 到 7；支持透明背景。最多 16 张参考图；`reference_usages` 可为 `source` 或 `element`，遮罩通过 `mask` 指定。 |
+
+GPT Image 2、Sunburst、Flare 可使用 `1K`、`2K`、`4K`，并支持指定尺寸或自定义比例。明确尺寸必须是 480 到 3840 的 16 倍数，总像素范围为 655,360 到 8,294,400，长宽比不超过 3:1。GPT Image 1.5 仅保留网页端已验证的 1K 档位。服务对 GPT 参考图和遮罩的总请求体上限为 64 MB，因此单张也限制为 64 MB；这是服务内存控制边界，低于上游某些模型可能给出的 100 MB 上传上限。遮罩必须是带透明通道的 PNG 或 WebP，且与第一张源图尺寸一致。
+
+公开 Firefly 文档中出现的 `negativePrompt`、`style`、`contentClass`、`promptBiasingLocaleCode`、`prompt_reasoner` 等字段属于 Firefly 公共模型或其他模型版本。当前发布的香蕉和 GPT Image 网页端 Schema 未把它们列为可接受参数，本服务会拒绝或不提供这些字段，避免上游静默忽略请求。
+
 ## Adobe 登录续期
 
 在账号池直接粘贴 Cookie 即可导入，无需手动填写访问令牌、用户标识或 ARP。服务从 Cookie 恢复真实身份，更新 Cookie 和令牌。直接续期保留同账号已有风险会话；从登录浏览器同步时使用该页面的最新会话，具体见[账号使用说明](accounts.md)。

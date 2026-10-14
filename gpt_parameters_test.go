@@ -123,8 +123,8 @@ func TestGPTRejectsOversizedAndContradictoryDimensionsBeforeGeneration(t *testin
 	}
 	for _, id := range []string{"gpt-image-2.5-sunburst", "gpt-image-2.5-flare"} {
 		input := GenerateInput{Model: id, Prompt: "山间小屋", AspectRatio: "16:9", Resolution: "4K"}
-		if err := validateInput(&input); err == nil {
-			t.Fatalf("GPT2.5 不应擅自开放页面未列出的比例：%s", id)
+		if err := validateInput(&input); err != nil {
+			t.Fatalf("GPT2.5 模型目录声明的合法尺寸应开放：%s %v", id, err)
 		}
 	}
 }

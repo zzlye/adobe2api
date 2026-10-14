@@ -843,6 +843,9 @@ func (a *App) adminGetSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func validateAdminSettings(settings Settings) error {
+	if settings.AccountStrategy != "" && settings.AccountStrategy != "round_robin" && settings.AccountStrategy != "random" {
+		return errors.New("账号分配方式应为轮询或随机")
+	}
 	if settings.PublicURL != "" {
 		u, err := url.Parse(settings.PublicURL)
 		if err != nil || u.Host == "" || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" {

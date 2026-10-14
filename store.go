@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	_ "golang.org/x/image/webp"
 	_ "modernc.org/sqlite"
 )
 
@@ -182,11 +183,17 @@ func (s *Store) Settings() Settings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	settings := s.settings
+	if settings.AccountStrategy == "" {
+		settings.AccountStrategy = "round_robin"
+	}
 	settings.APIKeys = append([]string{}, settings.APIKeys...)
 	return settings
 }
 
 func (s *Store) SaveSettings(settings Settings) error {
+	if settings.AccountStrategy == "" {
+		settings.AccountStrategy = "round_robin"
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	plain, err := json.Marshal(settingsEnvelope{Settings: settings, PasswordHash: settings.AdminPasswordHash, Version: settingsVersion})

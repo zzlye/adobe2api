@@ -12,6 +12,32 @@ var availableModels = []Model{
 	{ID: "gpt-image-1.5", Name: "GPT Image 1.5", AdobeID: "gpt-image", Version: "1.5", Ratios: []string{"1:1", "3:2", "2:3"}, Resolutions: []string{"1K"}},
 }
 
+// 能力来自 Adobe 模型目录，生成、协议校验和页面选项共用同一份定义。
+func init() {
+	for i := range availableModels {
+		m := &availableModels[i]
+		m.Qualities = []string{"auto"}
+		m.MaxReferences = 14
+		m.MaxReferenceBytes = 20 << 20
+		m.ReferenceUsages = []string{"general", "element"}
+		m.SupportsGroundSearch = m.AdobeID == "gemini-flash"
+		m.SupportsSeed = m.SupportsGroundSearch
+		if m.AdobeID == "gpt-image" {
+			m.MaxReferences, m.MaxDetailLevel = 16, 5
+			// GPT 上游单图上限高于服务请求体上限，因此目录展示服务可接受值。
+			m.MaxReferenceBytes = protocolBodyLimit
+			m.ReferenceUsages = []string{"source", "element"}
+			m.SupportsMask = true
+			m.Qualities = []string{"auto", "low", "medium", "high", "max"}
+			m.SupportsCustomSize = m.Version != "1.5"
+			if strings.HasPrefix(m.Version, "gpt-image-2.5-") {
+				m.MaxDetailLevel, m.SupportsTransparency = 7, true
+				m.Ratios = []string{"auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5", "21:9"}
+			}
+		}
+	}
+}
+
 func resolveModel(id string) (Model, bool) {
 	id = strings.TrimPrefix(id, "models/")
 	aliases := map[string]string{"nano-banana-2": "gemini-3.1-flash-image-preview", "gemini-3.1-flash-image": "gemini-3.1-flash-image-preview", "nano-banana-pro": "gemini-3-pro-image-preview", "gemini-3-pro-image": "gemini-3-pro-image-preview", "gpt-image-2.5-prism": "gpt-image-2.5-sunburst"}
