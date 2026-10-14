@@ -1,0 +1,18 @@
+.git
+.gitignore
+数据
+.capture
+data
+dist
+.env
+.env.*
+tmp
+node_modules
+*.exe
+*.test
+*.log
+*.har
+新建 文本文档*
+README.md
+docs
+compose.yaml

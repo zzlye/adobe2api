@@ -1,0 +1,22 @@
+services:
+  adobe2api:
+    build: .
+    container_name: adobe2api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      ADOBE2API_ADDR: ":8080"
+      ADOBE2API_DATA_DIR: /app/data
+      ADOBE2API_CHROME: /usr/bin/chromium
+      ADOBE2API_CHROME_NO_SANDBOX: "1"
+      GOMEMLIMIT: 256MiB
+    # 保留账号、设置、日志与图片，更新服务时可继续使用。
+    volumes:
+      - adobe2api_data:/app/data
+    shm_size: 256mb
+    init: true
+    stop_grace_period: 30s
+
+volumes:
+  adobe2api_data:

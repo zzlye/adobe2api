@@ -1,0 +1,10 @@
+/data/
+/dist/
+*.exe
+*.har
+新建 文本文档.txt
+.env
+.env.*
+*.log
+/.capture/
+/数据/
