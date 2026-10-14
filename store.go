@@ -44,7 +44,10 @@ type Store struct {
 type settingsEnvelope struct {
 	Settings     Settings `json:"settings"`
 	PasswordHash string   `json:"password_hash"`
+	Version      int      `json:"version"`
 }
+
+const settingsVersion = 1
 
 func NewStore(dataDir string) (*Store, error) {
 	abs, err := filepath.Abs(dataDir)
@@ -75,7 +78,7 @@ func NewStore(dataDir string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	s := &Store{db: db, dataDir: abs, aead: aead, imagePins: make(map[string]int), imageLeases: make(map[string]time.Time)}
-	s.settings = Settings{RefreshMinutes: 30, RetentionHours: 168, MaxStorageMB: 1024, MaxConcurrent: 2, RequestTimeoutSeconds: 300, LogRetentionDays: 30, APIKeys: []string{}}
+	s.settings = Settings{RefreshMinutes: 30, RetentionHours: 168, MaxStorageMB: 1024, MaxConcurrent: 2, RequestTimeoutSeconds: 300, LogRetentionDays: 0, APIKeys: []string{}}
 	schema := `
 CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id = 1), payload BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, enabled INTEGER NOT NULL, status TEXT NOT NULL, payload BLOB NOT NULL);
@@ -105,6 +108,15 @@ CREATE INDEX IF NOT EXISTS logs_status_created ON logs(status, created_at DESC);
 		}
 		s.settings = envelope.Settings
 		s.settings.AdminPasswordHash = envelope.PasswordHash
+		if envelope.Version < settingsVersion {
+			// 旧版本的默认清理会删掉诊断现场，升级时先关闭三项自动清理。
+			// 版本标记只迁移一次，之后管理员主动设置的保存策略继续生效。
+			s.settings.RetentionHours, s.settings.MaxStorageMB, s.settings.LogRetentionDays = 0, 0, 0
+			if err := s.SaveSettings(s.settings); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("迁移保存设置失败: %w", err)
+			}
+		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		db.Close()
 		return nil, err
@@ -177,7 +189,7 @@ func (s *Store) Settings() Settings {
 func (s *Store) SaveSettings(settings Settings) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	plain, err := json.Marshal(settingsEnvelope{Settings: settings, PasswordHash: settings.AdminPasswordHash})
+	plain, err := json.Marshal(settingsEnvelope{Settings: settings, PasswordHash: settings.AdminPasswordHash, Version: settingsVersion})
 	if err != nil {
 		return err
 	}
@@ -332,7 +344,7 @@ func (s *Store) SaveLog(log RequestLog) error {
 	}
 	log.Upstream = append([]UpstreamRecord(nil), log.Upstream...)
 	for i := range log.Upstream {
-		log.Upstream[i].URL = sanitizeLoggedURL(log.Upstream[i].URL)
+		log.Upstream[i] = sanitizeUpstreamRecord(log.Upstream[i])
 	}
 	payload, err := json.Marshal(log)
 	if err != nil {
@@ -356,6 +368,15 @@ func (s *Store) SaveLog(log RequestLog) error {
 }
 
 func (s *Store) Logs(page, limit int, status, query string) ([]RequestLog, int, error) {
+	return s.queryLogs(page, limit, status, query, false)
+}
+
+// LogSummaries 在数据库侧移除大型接口详情，列表只读取展示所需的记录和图片索引。
+func (s *Store) LogSummaries(page, limit int, status, query string) ([]RequestLog, int, error) {
+	return s.queryLogs(page, limit, status, query, true)
+}
+
+func (s *Store) queryLogs(page, limit int, status, query string, summary bool) ([]RequestLog, int, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -382,7 +403,12 @@ func (s *Store) Logs(page, limit int, status, query string) ([]RequestLog, int, 
 		return nil, 0, err
 	}
 	args = append(args, limit, (page-1)*limit)
-	rows, err := s.db.Query("SELECT payload FROM logs"+where+" ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?", args...)
+	projection := "payload"
+	if summary {
+		// 先投影再传回 Go，避免每页反序列化所有请求和响应正文；不修改数据库原始内容。
+		projection = "json_remove(CAST(payload AS TEXT), '$.upstream')"
+	}
+	rows, err := s.db.Query("SELECT "+projection+" FROM logs"+where+" ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?", args...)
 	if err != nil {
 		return nil, 0, err
 	}

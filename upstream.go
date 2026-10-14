@@ -27,6 +27,8 @@ const adobeUpstreamURL = "https://firefly-3p.ff.adobe.io"
 const adobeIMSURL = "https://adobeid-na1.services.adobe.com/ims/check/v6/token"
 const adobeIMSScope = "AdobeID,firefly_api,openid,pps.read,pps.write,additional_info.projectedProductContext,additional_info.ownerOrg,uds_read,uds_write,ab.manage,read_organizations,additional_info.roles,account_cluster.read,creative_production,tk_platform,tk_platform_sync,af_byof,profile,dii_lr_ml_unlimited"
 
+var errAdobeAccountMismatch = errors.New("Adobe 返回的登录账号与账号池记录不一致，请检查 Cookie")
+
 // AdobeGenerator 复用短连接池；图片在磁盘与网络间传输，不在内存中保存编码。
 type AdobeGenerator struct {
 	store          *Store
@@ -47,6 +49,8 @@ type UpstreamError struct {
 	StatusCode int
 	Code       string
 	Message    string
+	// AccessError 保留脱敏后的权限原因，区分模型无权限与登录失效。
+	AccessError string
 }
 
 func (e *UpstreamError) Error() string {
@@ -216,15 +220,44 @@ func adobeHeaders(request *http.Request, account Account, prompt string, generat
 }
 
 func (g *AdobeGenerator) do(client *http.Client, request *http.Request, log *RequestLog) (*http.Response, error) {
+	if log == nil {
+		// Refresh 保持原接口，通过上下文接入触发它的生成日志。
+		log, _ = request.Context().Value(requestLogContextKey{}).(*RequestLog)
+	}
+	var record UpstreamRecord
+	var secrets []string
+	recording := log != nil && len(log.Upstream) < 4096
+	details := recording && upstreamLogCanRecordDetails(log)
+	if recording {
+		secrets = upstreamHeaderSecrets(request.Header, nil)
+		record = UpstreamRecord{Method: request.Method, URL: upstreamLogURL(upstreamLogText(request.URL.String(), secrets))}
+		if details {
+			record.RequestHeaders = sanitizeUpstreamHeaders(request.Header, secrets)
+			record.RequestBody, secrets = captureUpstreamJSON(&request.Body, request.Header.Get("Content-Type"), request.ContentLength, secrets)
+		}
+	}
 	started := time.Now()
 	response, err := client.Do(request)
-	if log != nil && len(log.Upstream) < 4096 {
-		record := UpstreamRecord{Method: request.Method, URL: sanitizeLoggedURL(request.URL.String()), DurationMS: time.Since(started).Milliseconds()}
+	if response != nil && response.Request == nil {
+		response.Request = request
+	}
+	if recording {
+		record.DurationMS = time.Since(started).Milliseconds()
 		if response != nil {
+			secrets = upstreamHeaderSecrets(response.Header, secrets)
 			record.Status = response.StatusCode
-			record.RequestID = response.Header.Get("X-Request-Id")
+			record.RequestID = trimUpstreamLogText(upstreamLogText(response.Header.Get("X-Request-Id"), secrets), 1024)
+			if details {
+				record.ResponseHeaders = sanitizeUpstreamHeaders(response.Header, secrets)
+			}
+			if err == nil {
+				if details {
+					record.ResponseBody, secrets = captureUpstreamJSON(&response.Body, response.Header.Get("Content-Type"), response.ContentLength, secrets)
+				}
+				response.Body = attachUpstreamLogSecrets(response.Body, secrets)
+			}
 		}
-		log.Upstream = append(log.Upstream, record)
+		appendUpstreamLogRecord(log, sanitizeUpstreamRecordWithSecrets(record, secrets))
 	}
 	if err != nil {
 		if request.Context().Err() != nil {
@@ -262,6 +295,13 @@ func decodeAdobeResponse(response *http.Response) (adobeGenerationResponse, erro
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, (2<<20)+1))
 	if err != nil {
+		// 只传递标准上下文错误，既保留超时与取消分类，也避免原始读取错误泄露签名地址。
+		if errors.Is(err, context.DeadlineExceeded) {
+			return adobeGenerationResponse{}, context.DeadlineExceeded
+		}
+		if errors.Is(err, context.Canceled) {
+			return adobeGenerationResponse{}, context.Canceled
+		}
 		return adobeGenerationResponse{}, errors.New("读取 Adobe 响应失败")
 	}
 	if len(body) > 2<<20 {
@@ -274,13 +314,13 @@ func decodeAdobeResponse(response *http.Response) (adobeGenerationResponse, erro
 		if message == "" || len(message) > 1024 {
 			message = http.StatusText(response.StatusCode)
 		}
-		return payload, &UpstreamError{StatusCode: response.StatusCode, Code: payload.ErrorCode, Message: message}
+		return payload, adobeUpstreamError(response, response.StatusCode, payload.ErrorCode, message)
 	}
 	if decodeErr != nil {
 		return payload, errors.New("Adobe 返回了无效响应")
 	}
 	if payload.ErrorCode != "" {
-		return payload, &UpstreamError{StatusCode: http.StatusBadGateway, Code: payload.ErrorCode, Message: payload.Message}
+		return payload, adobeUpstreamError(response, http.StatusBadGateway, payload.ErrorCode, payload.Message)
 	}
 	return payload, nil
 }
@@ -350,7 +390,7 @@ func (g *AdobeGenerator) uploadReference(ctx context.Context, client *http.Clien
 		return "", errors.New("Adobe 参考图上传响应无效")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", &UpstreamError{StatusCode: response.StatusCode, Code: payload.ErrorCode, Message: payload.Message}
+		return "", adobeUpstreamError(response, response.StatusCode, payload.ErrorCode, payload.Message)
 	}
 	if len(payload.Images) == 0 || payload.Images[0].ID == "" {
 		return "", errors.New("Adobe 未返回参考图标识")
@@ -363,6 +403,20 @@ var adobeGPTSizes = map[string][2]int{
 	"1:1": {1024, 1024}, "4:5": {928, 1152}, "3:4": {896, 1200}, "2:3": {848, 1264}, "9:16": {768, 1376},
 }
 
+// GPT 的档位需按比例映射为输出宽高，不能采用香蕉的方形分辨率占位。
+var adobeGPTSizes2K = map[string][2]int{
+	"1:1": {2048, 2048}, "5:4": {2240, 1792}, "9:16": {1440, 2560}, "21:9": {3024, 1296}, "16:9": {2560, 1440},
+	"4:3": {2304, 1728}, "3:2": {2496, 1664}, "4:5": {1792, 2240}, "3:4": {1728, 2304}, "2:3": {1664, 2496},
+}
+
+var adobeGPTSizes4K = map[string][2]int{
+	"1:1": {2880, 2880}, "5:4": {3200, 2560}, "9:16": {2160, 3840}, "21:9": {3696, 1584}, "16:9": {3840, 2160},
+	"4:3": {3264, 2448}, "3:2": {3504, 2336}, "4:5": {2560, 3200}, "3:4": {2448, 3264}, "2:3": {2336, 3504},
+}
+
+const adobeGPTMaxEdge = 3840
+const adobeGPTMaxPixels = 8294400
+
 func parseAdobeSize(raw string) (int, int, error) {
 	parts := strings.Split(strings.ToLower(raw), "x")
 	if len(parts) != 2 {
@@ -370,7 +424,7 @@ func parseAdobeSize(raw string) (int, int, error) {
 	}
 	width, err1 := strconv.Atoi(parts[0])
 	height, err2 := strconv.Atoi(parts[1])
-	if err1 != nil || err2 != nil || width <= 0 || height <= 0 || width > 16384 || height > 16384 {
+	if err1 != nil || err2 != nil || width < 128 || height < 128 || width > 16384 || height > 16384 {
 		return 0, 0, errors.New("图片尺寸无效")
 	}
 	return width, height, nil
@@ -396,9 +450,28 @@ func closestAdobeRatio(width, height int, ratios []string) string {
 	return best
 }
 
-// adobeParameters 按页面模型能力转换参数；方形分辨率档位与输出比例分别传递。
+// adobeSizeResolution 统一接口和上游的尺寸档位推断，避免 2880 方形被误判成 2K。
+func adobeSizeResolution(model Model, width, height int) string {
+	pixels := int64(width) * int64(height)
+	if model.AdobeID == "gpt-image" && model.Version != "1.5" {
+		if pixels > 2048*2048 {
+			return "4K"
+		}
+	} else if pixels >= 8<<20 {
+		return "4K"
+	}
+	if pixels >= 2<<20 {
+		return "2K"
+	}
+	if pixels < 512*768 {
+		return "512"
+	}
+	return "1K"
+}
+
+// adobeParameters 由协议校验与实际生成共用，明确尺寸优先推断比例并验证上游硬限制。
 func adobeParameters(model Model, input GenerateInput) (string, string, int, int, error) {
-	ratio, resolution := input.AspectRatio, strings.ToUpper(input.Resolution)
+	ratio, resolution := strings.TrimSpace(input.AspectRatio), strings.ToUpper(strings.TrimSpace(input.Resolution))
 	width, height := 0, 0
 	if input.Size != "" && input.Size != "auto" {
 		var err error
@@ -406,28 +479,24 @@ func adobeParameters(model Model, input GenerateInput) (string, string, int, int
 		if err != nil {
 			return "", "", 0, 0, err
 		}
-		if ratio == "" {
-			ratio = closestAdobeRatio(width, height, model.Ratios)
-			if ratio == "" {
-				return "", "", 0, 0, errors.New("该模型不支持请求的图片比例")
-			}
+		if model.AdobeID == "gpt-image" && (width > adobeGPTMaxEdge || height > adobeGPTMaxEdge || int64(width)*int64(height) > adobeGPTMaxPixels) {
+			return "", "", 0, 0, errors.New("GPT 图片最长边不能超过 3840 像素，总像素不能超过 8294400")
 		}
-		if resolution == "" {
-			pixels := int64(width) * int64(height)
-			switch {
-			case pixels >= 8<<20 && hasString(model.Resolutions, "4K"):
-				resolution = "4K"
-			case pixels >= 2<<20 && hasString(model.Resolutions, "2K"):
-				resolution = "2K"
-			case pixels < 512*768 && hasString(model.Resolutions, "512"):
-				resolution = "512"
-			default:
-				resolution = "1K"
-			}
+		best := closestAdobeRatio(width, height, model.Ratios)
+		if best == "" {
+			return "", "", 0, 0, errors.New("该模型不支持请求的图片比例")
 		}
+		if ratio != "" && ratio != "auto" && ratio != best {
+			return "", "", 0, 0, errors.New("尺寸与画面比例不一致")
+		}
+		inferredResolution := adobeSizeResolution(model, width, height)
+		if resolution != "" && resolution != inferredResolution {
+			return "", "", 0, 0, errors.New("尺寸与分辨率档位不一致")
+		}
+		ratio, resolution = best, inferredResolution
 	}
 	if ratio == "" {
-		if input.Size == "auto" && hasString(model.Ratios, "auto") {
+		if hasString(model.Ratios, "auto") {
 			ratio = "auto"
 		} else {
 			ratio = "1:1"
@@ -441,6 +510,10 @@ func adobeParameters(model Model, input GenerateInput) (string, string, int, int
 	}
 	if !hasString(model.Resolutions, resolution) {
 		return "", "", 0, 0, errors.New("该模型不支持指定的分辨率")
+	}
+	if model.HighResolutionRequiresRatio && resolution != "1K" && ratio == "auto" {
+		// 高分辨率的自动模式尚未获得有效输出，不能省略尺寸后静默退回默认档位。
+		return "", "", 0, 0, errors.New("该模型在 2K、4K 分辨率下需要指定画面比例")
 	}
 	return ratio, resolution, width, height, nil
 }
@@ -484,7 +557,14 @@ func adobeGenerationBody(model Model, input GenerateInput, references []map[stri
 		actual := adobeGPTSizes[ratio]
 		if model.Version != "2" {
 			actual = map[string][2]int{"1:1": {1024, 1024}, "3:2": {1536, 1024}, "2:3": {1024, 1536}}[ratio]
-		} else if width > 0 && height > 0 {
+		}
+		if resolution == "2K" {
+			actual = adobeGPTSizes2K[ratio]
+		} else if resolution == "4K" {
+			actual = adobeGPTSizes4K[ratio]
+		}
+		if width > 0 && height > 0 {
+			// 自定义尺寸由页面原样提交，GPT2.5 同样不能回退到默认 1K。
 			actual = [2]int{width, height}
 		}
 		body["size"] = map[string]int{"width": actual[0], "height": actual[1]}
@@ -728,23 +808,48 @@ func (g *AdobeGenerator) Refresh(ctx context.Context, account Account) (updated 
 		}
 	}()
 	updated, err = g.refreshIMS(ctx, account)
-	if err == nil {
-		// 仅有 Cookie 的新账号还需要页面生成风险会话，不能把刷新令牌视作生图就绪。
-		if updated.ARPSession == "" {
-			if g.browserRefresh == nil {
-				return updated, errors.New("登录令牌已刷新，但缺少 Adobe 风险会话，需要浏览器同步")
-			}
-			return g.browserRefresh(ctx, updated)
-		}
+	if err == nil && updated.ARPSession != "" {
 		return updated, nil
 	}
 	if ctx.Err() != nil {
-		return account, ctx.Err()
+		// 取消前已完成的 IMS 轮换仍需交给调用方保存，避免下次再次使用旧 Cookie。
+		return updated, ctx.Err()
 	}
-	if g.browserRefresh != nil {
-		return g.browserRefresh(ctx, account)
+	if errors.Is(err, errAdobeAccountMismatch) {
+		// 身份已明确不一致时禁止使用其他浏览器会话掩盖错误。
+		return account, err
 	}
-	return account, err
+	if g.browserRefresh == nil {
+		if err == nil {
+			return updated, errors.New("登录令牌已刷新，但缺少 Adobe 风险会话，需要浏览器同步")
+		}
+		return account, err
+	}
+	browserAccount := account
+	if err == nil {
+		browserAccount = updated
+	}
+	browsed, browserErr := g.browserRefresh(ctx, browserAccount)
+	if browserErr != nil {
+		return browserAccount, browserErr
+	}
+	expectedUserID := adobeUserID(browserAccount)
+	if expectedUserID != "" && browsed.UserID != "" && expectedUserID != browsed.UserID {
+		return browserAccount, errAdobeAccountMismatch
+	}
+	if browsed.UserID == "" {
+		browsed.UserID = expectedUserID
+	}
+	if browsed.ARPSession == "" {
+		return browserAccount, errors.New("浏览器没有返回 Adobe 风险会话，请重新同步登录状态")
+	}
+	// 浏览器缓存的令牌可能属于其他权限范围，完成 Cookie 和风险会话后再次由 IMS 规范化。
+	refreshed, refreshErr := g.refreshIMS(ctx, browsed)
+	if refreshErr != nil {
+		// 最后一次 IMS 未确认页面凭据时，只返回前一次已确认的会话供失败分支保存。
+		return browserAccount, refreshErr
+	}
+	return refreshed, nil
 }
 
 func (g *AdobeGenerator) refreshIMS(ctx context.Context, account Account) (Account, error) {
@@ -752,9 +857,6 @@ func (g *AdobeGenerator) refreshIMS(ctx context.Context, account Account) (Accou
 		return account, errors.New("账号缺少 Adobe Cookie，需要重新导入登录状态")
 	}
 	userID := adobeUserID(account)
-	if userID == "" {
-		return account, errors.New("账号缺少 Adobe 用户标识，无法刷新登录状态")
-	}
 	client, _, err := g.clients()
 	if err != nil {
 		return account, err
@@ -763,7 +865,8 @@ func (g *AdobeGenerator) refreshIMS(ctx context.Context, account Account) (Accou
 	if clientID == "" {
 		clientID = "clio-playground-web"
 	}
-	form := url.Values{"client_id": {clientID}, "scope": {adobeIMSScope}, "user_id": {userID}}
+	// 登录 Cookie 本身即可恢复真实用户，不传猜测的用户标识或访客参数。
+	form := url.Values{"client_id": {clientID}, "scope": {adobeIMSScope}}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, adobeIMSURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return account, err
@@ -792,6 +895,10 @@ func (g *AdobeGenerator) refreshIMS(ctx context.Context, account Account) (Accou
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return account, &UpstreamError{StatusCode: response.StatusCode, Code: payload.ErrorCode, Message: "Adobe 登录状态无法刷新，需要重新登录"}
 	}
+	if payload.ErrorCode != "" {
+		// IMS 会在 HTTP 200 中返回认证失败，不能把业务错误误报为缺少令牌。
+		return account, &UpstreamError{StatusCode: http.StatusUnauthorized, Code: payload.ErrorCode, Message: "Adobe 登录状态已失效，请重新登录后同步 Cookie"}
+	}
 	token := payload.AccessToken
 	if token == "" {
 		token = payload.Token
@@ -799,20 +906,29 @@ func (g *AdobeGenerator) refreshIMS(ctx context.Context, account Account) (Accou
 	if token == "" {
 		return account, errors.New("Adobe 登录刷新未返回访问令牌")
 	}
+	refreshedUserID := payload.ProfileUserID
+	if refreshedUserID == "" {
+		refreshedUserID = payload.UserID
+	} else if payload.UserID != "" && payload.UserID != refreshedUserID {
+		return account, errAdobeAccountMismatch
+	}
+	if refreshedUserID == "" {
+		refreshedUserID = adobeUserID(Account{AccessToken: token})
+	}
+	if refreshedUserID == "" {
+		return account, errors.New("Adobe 登录刷新未返回用户身份，请重新登录或同步浏览器")
+	}
+	if userID != "" && userID != refreshedUserID {
+		return account, errAdobeAccountMismatch
+	}
 	account.Cookie = mergeAdobeCookies(account.Cookie, response.Cookies())
-	account.AccessToken, account.UserID = token, userID
-	if payload.UserID != "" {
-		account.UserID = payload.UserID
-	}
-	if payload.ProfileUserID != "" {
-		account.UserID = payload.ProfileUserID
-	}
+	account.AccessToken, account.UserID = token, refreshedUserID
 	if payload.RefreshToken != "" {
 		account.RefreshToken = payload.RefreshToken
 	}
 	account.ClientID = clientID
 	account.LastRefresh = time.Now().UTC()
-	account.LastError, account.Status = "", "ready"
+	account.LastError, account.Status = "", "unverified"
 	// IMS 的 expires_in 使用毫秒；未知有效期不猜测为固定一小时。
 	if milliseconds, err := strconv.ParseFloat(strings.Trim(string(payload.ExpiresIn), "\""), 64); err == nil && milliseconds > 0 && milliseconds <= float64(7*24*time.Hour/time.Millisecond) {
 		account.ExpiresAt = account.LastRefresh.Add(time.Duration(milliseconds) * time.Millisecond)

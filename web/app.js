@@ -71,7 +71,7 @@ function mountIcons(root = document) {
 
 const state = {
   authenticated: false, initialized: true, view: 'overview', accounts: [], models: [], settings: null,
-  stats: null, logsPage: 1, logsTotal: 0, logLimit: 20, accountEdit: null, accountMode: 'credentials',
+  stats: null, logsPage: 1, logsTotal: 0, logLimit: 20, accountEdit: null, accountMode: 'cookie', accountSubmitting: false,
   references: [], generating: false, generationController: null, generationTimer: null,
   settingsDirty: false, logsRequest: 0, accountsRequest: 0, drawerRequest: 0
 };
@@ -111,8 +111,8 @@ function duration(value) {
 }
 function statusBadge(value) {
   const key = String(value || 'unknown').toLowerCase();
-  const labels = { success: '已完成', failed: '失败', error: '异常', active: '正常', ready: '正常', healthy: '正常', valid: '正常', ok: '正常', expired: '已过期', refreshing: '刷新中', running: '生成中', pending: '等待中', disabled: '已停用', unknown: '未验证', missing: '待登录', cooldown: '稍后重试' };
-  const cls = ['active', 'ready', 'healthy', 'valid', 'ok'].includes(key) ? 'success' : ['pending', 'cooldown', 'missing', 'unknown'].includes(key) ? 'warning' : key;
+  const labels = { success: '已完成', failed: '失败', error: '异常', active: '正常', ready: '正常', healthy: '正常', valid: '正常', ok: '正常', expired: '已过期', refreshing: '刷新中', running: '生成中', pending: '等待续期', unverified: '待验证', disabled: '已停用', unknown: '未验证', missing: '待登录', missing_credentials: '待登录', cooldown: '稍后重试' };
+  const cls = ['active', 'ready', 'healthy', 'valid', 'ok'].includes(key) ? 'success' : ['pending', 'unverified', 'cooldown', 'missing', 'missing_credentials', 'unknown'].includes(key) ? 'warning' : key;
   return el('span', { class: `badge ${['success', 'failed', 'error', 'expired', 'refreshing', 'running', 'disabled', 'warning'].includes(cls) ? cls : ''}`, text: labels[key] || key });
 }
 function errorMessage(error) { return error instanceof Error ? error.message : String(error || '操作失败'); }
@@ -241,14 +241,23 @@ async function loadModels() {
 }
 function updateModelOptions() {
   const model = state.models.find(item => item.id === $('#generate-model').value);
-  const ratios = model?.ratios?.length ? model.ratios : ['1:1', '16:9', '9:16', '4:3', '3:4'];
   const resolutions = model?.resolutions?.length ? model.resolutions : ['1K', '2K', '4K'];
-  for (const [target, values] of [['#generate-ratio', ratios], ['#generate-resolution', resolutions]]) {
-    const select = $(target);
-    const previous = select.value;
-    select.replaceChildren(...values.map(value => el('option', { value, text: value === 'auto' ? '自动' : value })));
-    if (values.includes(previous)) select.value = previous;
-  }
+  const select = $('#generate-resolution');
+  const previous = select.value;
+  select.replaceChildren(...resolutions.map(value => el('option', { value, text: value })));
+  if (resolutions.includes(previous)) select.value = previous;
+  updateRatioOptions();
+}
+function updateRatioOptions() {
+  const model = state.models.find(item => item.id === $('#generate-model').value);
+  let ratios = model?.ratios?.length ? model.ratios : ['1:1', '16:9', '9:16', '4:3', '3:4'];
+  // 部分模型的大图请求必须指定比例，按模型能力联动选项，不提交无效的自动比例。
+  if (model?.high_resolution_requires_ratio && ['2K', '4K'].includes($('#generate-resolution').value)) ratios = ratios.filter(value => value !== 'auto');
+  const select = $('#generate-ratio');
+  const previous = select.value;
+  select.replaceChildren(...ratios.map(value => el('option', { value, text: value === 'auto' ? '自动' : value })));
+  if (ratios.includes(previous)) select.value = previous;
+  else if (previous === 'auto' && ratios.includes('1:1')) select.value = '1:1';
 }
 
 function renderStats(stats) {
@@ -321,7 +330,7 @@ function renderAccounts() {
   $('#accounts-empty').replaceChildren();
   if (!items.length) {
     $('#accounts-body').replaceChildren();
-    empty($('#accounts-empty'), query ? '没有找到匹配的账号' : '添加你的第一个账号', query ? '试试其他关键词。' : '登录凭据就绪后，即可开始生成。', 'users', query ? null : el('button', { class: 'button secondary tiny', onclick: () => openAccount() }, '添加账号'));
+    empty($('#accounts-empty'), query ? '没有找到匹配的账号' : '添加你的第一个账号', query ? '试试其他关键词。' : '导入 Cookie 或自动获取登录账号。', 'users', query ? null : el('button', { class: 'button secondary tiny', onclick: () => openAccount() }, '添加账号'));
     return;
   }
   $('#accounts-body').replaceChildren(...items.map(account => {
@@ -341,26 +350,31 @@ async function refreshAccount(account, button) {
   catch (error) { toast(errorMessage(error), true); button.disabled = false; button.replaceChildren(icon('refresh')); await loadAccounts(); }
 }
 function setAccountMode(mode) {
+  if (state.accountSubmitting) return;
   state.accountMode = mode;
-  $('#account-credentials').hidden = mode !== 'credentials';
-  $('#account-capture').hidden = mode !== 'capture';
+  $('#account-cookie').hidden = mode !== 'cookie';
+  $('#account-browser').hidden = mode !== 'browser';
   $$('[data-account-mode]').forEach(button => button.classList.toggle('selected', button.dataset.accountMode === mode));
-  $('#account-form').elements.capture.required = mode === 'capture';
+  const form = $('#account-form');
+  form.elements.cookie.required = mode === 'cookie' && !state.accountEdit;
+  form.elements.name.required = Boolean(state.accountEdit);
+  $('#account-submit').textContent = state.accountEdit ? '保存账号' : mode === 'browser' ? '获取账号' : '导入账号';
+  $('#account-form-error').hidden = true;
 }
 function openAccount(account = null) {
+  if (state.accountSubmitting) return;
   state.accountEdit = account;
   $('#account-form').reset();
   $('#account-form-error').hidden = true;
   $('#account-dialog-title').textContent = account ? '编辑账号' : '添加账号';
   $('#account-tabs').hidden = Boolean(account);
-  setAccountMode('credentials');
+  setAccountMode('cookie');
   const form = $('#account-form');
   if (account) {
     form.elements.name.value = account.name || '';
-    form.elements.email.value = account.email || '';
   }
+  form.elements.name.placeholder = account ? '账号名称' : '留空自动命名';
   form.elements.cookie.placeholder = account ? '留空保留当前 Cookie' : '粘贴已登录账号的 Cookie';
-  form.elements.access_token.placeholder = account ? '留空保留当前 Access Token' : '';
   $('#account-dialog').showModal();
 }
 async function confirmAction(title, message, label = '确认') {
@@ -414,6 +428,8 @@ function closeDrawer() {
   ++state.drawerRequest;
   $('#log-drawer').hidden = true;
   $('#drawer-scrim').hidden = true;
+  // 关闭详情后释放图片与诊断文本，不让隐藏抽屉继续保留整条记录。
+  $('#log-detail').replaceChildren();
   document.body.style.overflow = '';
   if (drawerOpener instanceof HTMLElement && drawerOpener.isConnected) drawerOpener.focus({ preventScroll: true });
   drawerOpener = null;
@@ -439,6 +455,24 @@ function imageTile(image, label = '生成图片') {
   const img = el('img', { src: url, alt: label, loading: 'lazy', decoding: 'async', onerror: () => img.replaceWith(el('div', { class: 'deleted-image' }, icon('image'), '图片不可用')) });
   return el('button', { class: 'detail-image', 'aria-label': `查看${label}`, onclick: () => openImage(image) }, img);
 }
+// 请求与响应按需渲染，关闭折叠项后释放内容节点，避免长记录占用过多页面内存。
+function upstreamDetail(label, headers, body) {
+  const hasHeaders = headers && typeof headers === 'object' && !Array.isArray(headers) && Object.keys(headers).length;
+  const hasBody = typeof body === 'string' && body.trim();
+  if (!hasHeaders && !hasBody) return null;
+  const details = el('details', { class: 'upstream-details' }, el('summary', { text: label }));
+  details.addEventListener('toggle', () => {
+    details.querySelector('.upstream-content')?.remove();
+    if (!details.open) return;
+    // 诊断内容只能作为文本展示，即使包含 HTML 也不会执行。
+    details.append(el('div', { class: 'upstream-content' },
+      hasHeaders ? el('h4', { text: label === '请求内容' ? '请求头' : '响应头' }) : null,
+      hasHeaders ? el('pre', { class: 'detail-params', text: JSON.stringify(headers, null, 2) }) : null,
+      hasBody ? el('h4', { text: label === '请求内容' ? '请求参数' : '响应正文' }) : null,
+      hasBody ? el('pre', { class: 'detail-params', text: body }) : null));
+  });
+  return details;
+}
 function renderLogDetail(log) {
   const params = parameters(log);
   const children = [el('div', { class: 'detail-status' }, statusBadge(log.status), el('span', { class: 'small muted', text: date(log.created_at) }))];
@@ -448,7 +482,9 @@ function renderLogDetail(log) {
   children.push(el('div', { class: 'detail-facts' }, fact('模型', modelName(log.model)), fact('账号', log.account_name), fact('耗时', duration(log.duration_ms)), fact('消耗积分', count(log.credits, 2)), fact('画面比例', params.aspect_ratio || '自动'), fact('分辨率', params.resolution || params.size), fact('接口协议', log.protocol), fact('请求状态', log.http_status), fact('请求地址', log.endpoint), fact('记录编号', log.id)));
   if (log.references?.length) children.push(el('div', { class: 'detail-section' }, el('h3', { text: `参考图 · ${log.references.length} 张` }), el('div', { class: 'detail-images detail-reference' }, ...log.references.map(image => imageTile(image, '参考图')))));
   children.push(el('div', { class: 'detail-section' }, el('h3', { text: '请求参数' }), el('pre', { class: 'detail-params', text: JSON.stringify(params, null, 2) })));
-  const calls = (log.upstream || []).map(call => el('div', { class: 'upstream-item' }, el('div', { class: 'upstream-top' }, el('strong', { text: call.method || 'GET' }), el('span', { text: duration(call.duration_ms) }), el('span', { class: `badge ${call.status >= 200 && call.status < 400 ? 'success' : 'failed'}`, text: call.status || '—' })), el('div', { class: 'upstream-url', text: call.url }), call.request_id ? el('div', { class: 'upstream-url', text: `请求编号：${call.request_id}` }) : null));
+  const calls = (log.upstream || []).map(call => el('div', { class: 'upstream-item' }, el('div', { class: 'upstream-top' }, el('strong', { text: call.method || 'GET' }), el('span', { text: duration(call.duration_ms) }), el('span', { class: `badge ${call.status >= 200 && call.status < 400 ? 'success' : 'failed'}`, text: call.status || '—' })), el('div', { class: 'upstream-url', text: call.url }), call.request_id ? el('div', { class: 'upstream-url', text: `请求编号：${call.request_id}` }) : null,
+    upstreamDetail('请求内容', call.request_headers, call.request_body),
+    upstreamDetail('响应内容', call.response_headers, call.response_body)));
   children.push(el('div', { class: 'detail-section' }, el('h3', { text: `接口记录 · ${calls.length} 次` }), ...calls, calls.length ? null : el('p', { class: 'small muted', text: '暂无接口调用记录' })));
   $('#log-detail').replaceChildren(...children);
 }
@@ -597,7 +633,7 @@ $('#drawer-scrim').addEventListener('click', closeDrawer);
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && !$('#log-drawer').hidden && !$$('dialog[open]').length) closeDrawer();
   if (event.key === 'Tab' && !$('#log-drawer').hidden && !$$('dialog[open]').length) {
-    const nodes = $$('button, a[href], [tabindex="0"]', $('#log-drawer')).filter(node => !node.hidden && !node.disabled);
+    const nodes = $$('button, a[href], summary, [tabindex="0"]', $('#log-drawer')).filter(node => !node.hidden && !node.disabled && node.getClientRects().length);
     const first = nodes[0], last = nodes[nodes.length - 1];
     if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
@@ -607,27 +643,42 @@ window.addEventListener('hashchange', () => { const view = location.hash.slice(1
 $('#add-account').addEventListener('click', () => openAccount());
 $('#account-search').addEventListener('input', renderAccounts);
 $$('[data-account-mode]').forEach(button => button.addEventListener('click', () => setAccountMode(button.dataset.accountMode)));
+// 保存期间锁定表单，避免重复导入以及切换模式后误用正在执行的请求。
+$('#account-dialog').addEventListener('cancel', event => { if (state.accountSubmitting) event.preventDefault(); });
+$('#account-dialog').addEventListener('close', () => {
+  $('#account-form').reset();
+  state.accountEdit = null;
+});
 $('#account-form').addEventListener('submit', async event => {
   event.preventDefault();
+  if (state.accountSubmitting) return;
   const form = event.currentTarget;
   const body = { name: form.elements.name.value.trim() };
-  if (!body.name) { form.elements.name.focus(); return; }
-  if (state.accountMode === 'capture') body.capture = form.elements.capture.value;
-  else {
-    for (const key of ['email', 'cookie', 'access_token', 'refresh_token', 'client_id', 'api_key', 'arp_session']) {
-      const value = form.elements[key].value.trim();
-      // 编辑时忽略空的敏感字段，使原登录信息得到保留。
-      if (value || !state.accountEdit || key === 'email') body[key] = value;
-    }
-    if (!state.accountEdit) body.enabled = true;
+  if (state.accountEdit && !body.name) { form.elements.name.focus(); return; }
+  if (state.accountMode === 'cookie') {
+    const cookie = form.elements.cookie.value.trim();
+    // 编辑时忽略空 Cookie，服务器会保留已有登录信息。
+    if (cookie) body.cookie = cookie;
+    else if (!state.accountEdit) { form.elements.cookie.focus(); return; }
   }
-  const button = $('#account-submit'); busy(button, true, '正在保存'); $('#account-form-error').hidden = true;
+  const browserMode = state.accountMode === 'browser';
+  const editing = Boolean(state.accountEdit);
+  const path = editing ? `/api/admin/accounts/${encodeURIComponent(state.accountEdit.id)}` : browserMode ? '/api/admin/accounts/browser' : '/api/admin/accounts/import';
+  const button = $('#account-submit');
+  state.accountSubmitting = true;
+  $$('#account-form input, #account-form textarea, #account-form [data-account-mode], #account-form [data-close-dialog]').forEach(input => { input.disabled = true; });
+  busy(button, true, browserMode ? '正在获取' : '正在保存'); $('#account-form-error').hidden = true;
   try {
-    const path = state.accountMode === 'capture' ? '/api/admin/accounts/import' : state.accountEdit ? `/api/admin/accounts/${encodeURIComponent(state.accountEdit.id)}` : '/api/admin/accounts';
-    await api(path, { method: state.accountEdit ? 'PUT' : 'POST', body });
-    $('#account-dialog').close(); form.reset(); toast('账号已保存'); await loadAccounts();
+    const result = await api(path, { method: editing ? 'PUT' : 'POST', body });
+    $('#account-dialog').close();
+    toast(browserMode ? result.created ? '账号已导入' : '账号登录已更新' : editing ? '账号已保存' : '账号已导入');
+    await loadAccounts();
   } catch (error) { $('#account-form-error').textContent = errorMessage(error); $('#account-form-error').hidden = false; }
-  finally { busy(button, false); }
+  finally {
+    state.accountSubmitting = false;
+    $$('#account-form input, #account-form textarea, #account-form [data-account-mode], #account-form [data-close-dialog]').forEach(input => { input.disabled = false; });
+    busy(button, false);
+  }
 });
 let logSearchTimer;
 $('#log-search').addEventListener('input', () => { clearTimeout(logSearchTimer); logSearchTimer = setTimeout(() => { state.logsPage = 1; loadLogs(); }, 350); });
@@ -663,6 +714,7 @@ $('#cleanup').addEventListener('click', async () => {
   finally { busy(button, false); }
 });
 $('#generate-model').addEventListener('change', updateModelOptions);
+$('#generate-resolution').addEventListener('change', updateRatioOptions);
 $('#reference-input').addEventListener('change', event => { const files = Array.from(event.target.files || []); event.target.value = ''; uploadReferences(files); });
 $('#reference-upload').addEventListener('dragover', event => { event.preventDefault(); });
 $('#reference-upload').addEventListener('drop', event => { event.preventDefault(); if (event.dataTransfer?.files) uploadReferences(Array.from(event.dataTransfer.files)); });

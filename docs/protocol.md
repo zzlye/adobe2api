@@ -18,9 +18,9 @@ Gemini 兼容接口使用 `x-goog-api-key`，也可通过查询参数 `key` 传�
 
 ## Adobe 登录续期
 
-在账号池导入 Adobe 已登录页面的生图请求，并补充 Cookie。服务自动更新 Cookie 与访问令牌，保留有效的风险会话；续期后生成的完整流程已在真实账号验证。
+在账号池直接粘贴 Cookie 即可导入，无需手动填写访问令牌、用户标识或 ARP。服务从 Cookie 恢复真实身份，更新 Cookie 和令牌。直接续期保留同账号已有风险会话；从登录浏览器同步时使用该页面的最新会话，具体见[账号使用说明](accounts.md)。
 
-缺少风险会话时，服务尝试从浏览器同步。实测新浏览器会话仍可能被 Adobe 拒绝并返回 `408 timeout_error / system under load`。Adobe 要求重新验证时，需要在已登录页面完成验证，再重新导入该页面的生图请求。
+缺少风险会话时，服务尝试从浏览器补齐，再用 Cookie 更新最终访问令牌。凭据读取成功显示为“待验证”，只有真实生成成功才显示“可用”。实测新风险会话仍可能返回 `408 timeout_error / system under load`；这类响应不等同于 Cookie 失效，也不能据此确定是上游负载或风险校验。Adobe 要求重新验证时，在登录页面完成验证后重新同步。
 
 普通上游请求支持带认证的代理，但浏览器续期暂不支持代理用户名密码。需要浏览器同步时，应配置不带账号密码的本地或上游代理出口。
 
@@ -49,7 +49,21 @@ Gemini 兼容接口使用 `x-goog-api-key`，也可通过查询参数 `key` 传�
 | `quality` | 模型支持的画质档位 |
 | `response_format` | `url` 或 `b64_json` |
 
-`size`、`aspect_ratio` 与 `resolution` 会转换为所选模型支持的比例和分辨率；不支持的组合返回参数错误。接口不会把任意像素尺寸解释为上游一定支持精确尺寸。
+`size`、`aspect_ratio` 与 `resolution` 必须一致，不支持的组合会返回参数错误。香蕉将尺寸转换为分辨率档位，比例单独传递；GPT Image 2、Sunburst、Flare 的明确 `size` 经校验后原样提交。
+
+GPT Image 2、Sunburst 和 Flare 支持 1K、2K、4K。GPT 最长边为 3840 像素、总像素上限为 8,294,400；4K 方形为 2880×2880，3:2 为 3504×2336，GPT Image 2 的 16:9 为 3840×2160。2K、4K 需指定画面比例；1K 可使用自动比例。香蕉 4K 的 4096×4096 档位与 GPT 的尺寸约束不同。GPT Image 1.5 暂保留 1K。
+
+例如，生成 GPT Image 2 的 4K 横图：
+
+```json
+{
+  "model": "gpt-image-2",
+  "prompt": "清晨阳光照进白色房间，桌上一只陶瓷花瓶",
+  "aspect_ratio": "16:9",
+  "resolution": "4K",
+  "response_format": "url"
+}
+```
 
 URL 返回示例：
 

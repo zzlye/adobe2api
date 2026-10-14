@@ -47,73 +47,11 @@ func validateInput(input *GenerateInput) error {
 	if !hasString([]string{"auto", "low", "medium", "high"}, input.Quality) {
 		return errors.New("画质应为 auto、low、medium 或 high")
 	}
-	input.Resolution = strings.ToUpper(strings.TrimSpace(input.Resolution))
-	input.AspectRatio = strings.TrimSpace(input.AspectRatio)
-	if input.Size != "" && input.Size != "auto" {
-		dimensions := strings.Split(strings.ToLower(input.Size), "x")
-		if len(dimensions) != 2 {
-			return errors.New("尺寸应为宽x高或 auto")
-		}
-		width, e1 := strconv.Atoi(dimensions[0])
-		height, e2 := strconv.Atoi(dimensions[1])
-		if e1 != nil || e2 != nil || width < 128 || height < 128 || width > 16384 || height > 16384 {
-			return errors.New("图片尺寸超出支持范围")
-		}
-		// 一些客户端使用 1024x1792 等标准尺寸，先按最接近的模型比例匹配，再判断容差。
-		best, distance := "", 100.0
-		ratio := float64(width) / float64(height)
-		for _, candidate := range model.Ratios {
-			parts := strings.Split(candidate, ":")
-			if len(parts) != 2 {
-				continue
-			}
-			x, _ := strconv.ParseFloat(parts[0], 64)
-			y, _ := strconv.ParseFloat(parts[1], 64)
-			difference := ratio/(x/y) - 1
-			if difference < 0 {
-				difference = -difference
-			}
-			if difference < distance {
-				distance, best = difference, candidate
-			}
-		}
-		if distance > .035 {
-			return errors.New("所选模型不支持该尺寸比例")
-		}
-		// 以总像素判定档位，超宽画面的长边不能代表分辨率档位。
-		pixels := int64(width) * int64(height)
-		resolution := "1K"
-		if pixels < 512*768 {
-			resolution = "512"
-		} else if pixels >= 8<<20 {
-			resolution = "4K"
-		} else if pixels >= 2<<20 {
-			resolution = "2K"
-		}
-		if input.AspectRatio != "" && input.AspectRatio != "auto" && input.AspectRatio != best {
-			return errors.New("尺寸与画面比例不一致")
-		}
-		if input.Resolution != "" && input.Resolution != resolution {
-			return errors.New("尺寸与分辨率档位不一致")
-		}
-		input.AspectRatio, input.Resolution = best, resolution
+	ratio, resolution, _, _, err := adobeParameters(model, *input)
+	if err != nil {
+		return err
 	}
-	if input.AspectRatio == "" {
-		if hasString(model.Ratios, "auto") {
-			input.AspectRatio = "auto"
-		} else {
-			input.AspectRatio = "1:1"
-		}
-	}
-	if input.Resolution == "" {
-		input.Resolution = "1K"
-	}
-	if !hasString(model.Ratios, input.AspectRatio) {
-		return errors.New("所选模型不支持该画面比例")
-	}
-	if !hasString(model.Resolutions, input.Resolution) {
-		return errors.New("所选模型不支持该分辨率")
-	}
+	input.AspectRatio, input.Resolution = ratio, resolution
 	limit := 6
 	if model.Version == "nano-banana" {
 		limit = 4

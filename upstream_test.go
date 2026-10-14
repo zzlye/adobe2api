@@ -247,7 +247,7 @@ func TestAdobeIMSRefreshUsesCookieAndMillisecondExpiry(t *testing.T) {
 		if request.URL.String() != adobeIMSURL || request.Method != http.MethodPost || request.Header.Get("Authorization") != "" || !strings.Contains(request.Header.Get("Cookie"), "ims_sid=old") {
 			t.Fatal("IMS 刷新应使用官方 Cookie 接口")
 		}
-		if err := request.ParseForm(); err != nil || request.Form.Get("user_id") != "user@AdobeID" || request.Form.Get("client_id") != "clio-playground-web" || !strings.Contains(request.Form.Get("scope"), "firefly_api") || request.Form.Get("client_secret") != "" {
+		if err := request.ParseForm(); err != nil || request.Form.Get("user_id") != "" || request.Form.Get("guest_allowed") != "" || len(request.Form) != 2 || request.Form.Get("client_id") != "clio-playground-web" || !strings.Contains(request.Form.Get("scope"), "firefly_api") || request.Form.Get("client_secret") != "" {
 			t.Fatal("IMS 刷新参数无效")
 		}
 		return adobeTestResponse(200, http.Header{"Set-Cookie": {"ims_sid=new; Secure; HttpOnly", "aux_sid=; Max-Age=0"}}, `{"access_token":"new-token","expires_in":3600000,"userId":"user@AdobeID"}`), nil
@@ -268,15 +268,19 @@ func TestAdobeIMSRefreshUsesCookieAndMillisecondExpiry(t *testing.T) {
 func TestAdobeRefreshFallsBackToBrowser(t *testing.T) {
 	called := 0
 	generator := newAdobeTestGenerator(t, func(request *http.Request) (*http.Response, error) {
+		if strings.Contains(request.Header.Get("Cookie"), "ims_sid=recovered") {
+			return adobeTestResponse(200, nil, `{"access_token":"ims-recovered-token","userId":"user@AdobeID"}`), nil
+		}
 		return adobeTestResponse(401, nil, `{"error":"invalid_cookie"}`), nil
 	})
 	generator.browserRefresh = func(ctx context.Context, account Account) (Account, error) {
 		called++
 		account.AccessToken = "browser-token"
+		account.Cookie, account.ARPSession = "ims_sid=recovered", "recovered-arp"
 		return account, nil
 	}
 	account, err := generator.Refresh(context.Background(), Account{UserID: "user@AdobeID", Cookie: "ims_sid=expired"})
-	if err != nil || account.AccessToken != "browser-token" || called != 1 {
+	if err != nil || account.AccessToken != "ims-recovered-token" || called != 1 {
 		t.Fatalf("Cookie 失效应尝试浏览器刷新：%+v %v", account, err)
 	}
 }
@@ -292,10 +296,11 @@ func TestAdobeNewCookieAccountObtainsARPAfterTokenRefresh(t *testing.T) {
 			t.Fatal("浏览器同步应接收 IMS 更新后的账号")
 		}
 		account.ARPSession = "fresh-arp"
+		account.AccessToken = "stale-browser-token"
 		return account, nil
 	}
-	account, err := generator.Refresh(context.Background(), Account{UserID: "user@AdobeID", Cookie: "ims_sid=old"})
-	if err != nil || !called || account.ARPSession != "fresh-arp" {
+	account, err := generator.Refresh(context.Background(), Account{Cookie: "ims_sid=old"})
+	if err != nil || !called || account.ARPSession != "fresh-arp" || account.AccessToken != "new-token" {
 		t.Fatalf("只有 Cookie 的账号必须获取风险会话：%+v %v", account, err)
 	}
 }

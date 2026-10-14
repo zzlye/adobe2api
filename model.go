@@ -77,23 +77,31 @@ type RequestLog struct {
 	Images      []ImageRecord    `json:"images"`
 	References  []ImageRecord    `json:"references"`
 	Upstream    []UpstreamRecord `json:"upstream"`
+	// 详情预算只用于当前请求的内存控制，不进入持久化或管理接口。
+	upstreamDetailBytes       int
+	upstreamDetailInitialized bool
 }
 
 type UpstreamRecord struct {
-	Method     string `json:"method"`
-	URL        string `json:"url"`
-	Status     int    `json:"status"`
-	DurationMS int64  `json:"duration_ms"`
-	RequestID  string `json:"request_id,omitempty"`
+	Method          string            `json:"method"`
+	URL             string            `json:"url"`
+	Status          int               `json:"status"`
+	DurationMS      int64             `json:"duration_ms"`
+	RequestID       string            `json:"request_id,omitempty"`
+	RequestHeaders  map[string]string `json:"request_headers,omitempty"`
+	RequestBody     string            `json:"request_body,omitempty"`
+	ResponseHeaders map[string]string `json:"response_headers,omitempty"`
+	ResponseBody    string            `json:"response_body,omitempty"`
 }
 
 type Model struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	AdobeID     string   `json:"adobe_id"`
-	Version     string   `json:"version"`
-	Ratios      []string `json:"ratios"`
-	Resolutions []string `json:"resolutions"`
+	ID                          string   `json:"id"`
+	Name                        string   `json:"name"`
+	AdobeID                     string   `json:"adobe_id"`
+	Version                     string   `json:"version"`
+	Ratios                      []string `json:"ratios"`
+	Resolutions                 []string `json:"resolutions"`
+	HighResolutionRequiresRatio bool     `json:"high_resolution_requires_ratio,omitempty"`
 }
 
 type GenerateInput struct {

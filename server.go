@@ -95,6 +95,9 @@ func (a *App) Handler() http.Handler {
 
 type imageInputReleaseKey struct{}
 
+// 生成中触发的续期等内部请求共享同一条日志，管理后台独立续期不绑定生成记录。
+type requestLogContextKey struct{}
+
 // 大型 JSON 编码只允许少量请求同时解析，转换为磁盘图片后立即释放名额。
 func (a *App) imageInput(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -216,11 +219,13 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 	entry.AccountName = account.Name
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(a.store.Settings().RequestTimeoutSeconds)*time.Second)
 	defer cancel()
+	ctx = context.WithValue(ctx, requestLogContextKey{}, &entry)
 	unpin := a.store.PinImages(input.References)
 	defer unpin()
 	if account.AccessToken == "" || account.UserID == "" || account.Status == "pending" || account.Status == "expired" || (!account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) < time.Minute) {
 		refreshed, err := a.generator.Refresh(ctx, account)
 		if err != nil {
+			account = mergeConfirmedRefresh(account, refreshed)
 			account.LastError = safeError(err)
 			account.Status = "expired"
 			_ = a.store.SaveAccount(account)
@@ -235,13 +240,20 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 	result, err := a.generator.Generate(ctx, account, input, &entry)
 	if err != nil {
 		account.LastError = safeError(err)
+		account.Status = "error"
 		var upstream *UpstreamError
 		if errors.As(err, &upstream) {
 			entry.HTTPStatus = upstream.StatusCode
-			if upstream.StatusCode == 401 || upstream.StatusCode == 403 {
+			// 模型无权限属于账号套餐错误，不能要求有效登录重新续期。
+			if upstream.StatusCode == 401 || upstream.StatusCode == 403 && upstream.AccessError != "user_not_entitled" {
 				account.Status = "expired"
 			}
 		}
+		_ = a.store.SaveAccount(account)
+	} else {
+		// 只有真实生成成功才标记可用，令牌续期不代表生图能力已验证。
+		account.LastError = ""
+		account.Status = "ready"
 		_ = a.store.SaveAccount(account)
 	}
 	return finish(result, err)
@@ -295,6 +307,7 @@ func (a *App) maintenance(ctx context.Context) {
 				if refreshErr == nil {
 					_ = a.store.SaveAccount(refreshed)
 				} else {
+					account = mergeConfirmedRefresh(account, refreshed)
 					account.Status = "expired"
 					account.LastError = safeError(refreshErr)
 					account.LastRefresh = time.Now()

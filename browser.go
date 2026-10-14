@@ -17,7 +17,6 @@ import (
 
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
-	"github.com/chromedp/cdproto/storage"
 	"github.com/chromedp/chromedp"
 	"github.com/chromedp/chromedp/remote"
 )
@@ -36,11 +35,17 @@ const browserSessionScript = `(async () => {
  // 风险会话有周期更新，短暂稳定即可；只有会话编号的初始值不能作为就绪凭据。
  const readArp = source => new Promise((resolve,reject) => {
   let dispose,timer,latest=null,firstAt=0,changedAt=0,done=false;
-  const initial = value => {
+  const validArp = value => {
+   if(typeof value!=='string'||!value.trim())return false;
    try {
     const encoded=value.replace(/-/g,'+').replace(/_/g,'/');
     const payload=JSON.parse(atob(encoded));
-    return payload&&typeof payload==='object'&&Object.keys(payload).every(key=>key==='sid'||key==='metadata');
+    if(!payload||typeof payload!=='object'||Array.isArray(payload)||typeof payload.sid!=='string'||!payload.sid.trim())return false;
+    // 官方供应商数据允许字符串或对象，至少有一份有效数据才继续读取会话。
+    return ['ftr','ark','bfp','fpjs'].some(key=>{
+     const token=payload[key];
+     return typeof token==='string'?Boolean(token.trim()):token!==null&&typeof token==='object'&&!Array.isArray(token)&&Object.keys(token).length>0;
+    });
    }catch{return false}
   };
   const finish = error => {
@@ -56,8 +61,8 @@ const browserSessionScript = `(async () => {
   });
   const check = () => {
    const now=Date.now();
-   if(now>deadline)return finish(new Error('Adobe 风险会话尚未完成初始化，请重新导入已登录页面的生图请求'));
-   if(latest&&firstAt&&now-firstAt>=20000&&now-changedAt>=1500&&!initial(latest))return finish();
+   if(now>deadline)return finish(new Error('Adobe 风险会话尚未完成初始化，请打开已登录的 Adobe 生图页面后重新同步'));
+   if(latest&&firstAt&&now-firstAt>=20000&&now-changedAt>=1500&&validArp(latest))return finish();
    timer=setTimeout(check,250);
   };
   timer=setTimeout(check,250);
@@ -75,7 +80,7 @@ const browserSessionScript = `(async () => {
  };
  const deadline=Date.now()+60000;
  let auth;
- while(!(auth=find())){if(Date.now()>deadline)throw new Error('未找到 Adobe 登录会话，请重新导入 Cookie');await new Promise(r=>setTimeout(r,500))}
+ while(!(auth=find())){if(Date.now()>deadline)throw new Error('Adobe 生图页面未加载完成，请检查网络后重试');await new Promise(r=>setTimeout(r,500))}
  if(window.adobeIMS)await window.adobeIMS.refreshToken();
  let token,arp,profile;
  do {
@@ -107,9 +112,36 @@ func (a *App) refreshBrowser(ctx context.Context, account Account) (Account, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
+	endpoint := browserEndpointForAccount(account, os.Getenv("ADOBE2API_CDP_URL"))
+	updated, err := a.refreshBrowserSession(ctx, account, endpoint)
+	if err != nil && endpoint != "" && account.Cookie != "" && ctx.Err() == nil {
+		// 当前登录页可能是池内另一个账号，失败时改用本账号 Cookie 独立续期。
+		return a.refreshBrowserSession(ctx, account, "")
+	}
+	return updated, err
+}
+
+// Cookie-only 账号尚不能核对当前浏览器身份，必须放在独立浏览器中恢复。
+func browserEndpointForAccount(account Account, endpoint string) string {
+	if account.Cookie != "" && account.UserID == "" {
+		return ""
+	}
+	return strings.TrimSpace(endpoint)
+}
+
+func validateBrowserSession(account Account, session browserSession) error {
+	if session.AccessToken == "" || session.ARPSession == "" || session.Profile.UserID == "" {
+		return errors.New("Adobe 登录会话不完整，请重新登录后同步")
+	}
+	if account.UserID != "" && account.UserID != session.Profile.UserID {
+		return errors.New("浏览器登录账号与账号池记录不一致")
+	}
+	return nil
+}
+
+func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoint string) (Account, error) {
 	var allocCtx context.Context
 	var allocCancel context.CancelFunc
-	endpoint := os.Getenv("ADOBE2API_CDP_URL")
 	if endpoint != "" {
 		// 连接已登录浏览器时仍核对用户标识，防止混用两个账号的会话。
 		allocCtx, allocCancel = remote.NewAllocator(ctx, endpoint)
@@ -150,12 +182,17 @@ func (a *App) refreshBrowser(ctx context.Context, account Account) (Account, err
 		if err != nil {
 			return account, fmt.Errorf("连接浏览器失败: %w", err)
 		}
+		found := false
 		for _, target := range targets {
 			if target.Type == "page" && strings.HasPrefix(target.URL, "https://firefly.adobe.com/generate/image") {
-				browserCtx, browserCancel = chromedp.NewContext(allocCtx, chromedp.WithTargetID(target.TargetID), chromedp.WithDetachOnCancel())
+				browserCtx, browserCancel = chromedp.NewContext(browserCtx, chromedp.WithTargetID(target.TargetID), chromedp.WithDetachOnCancel())
 				defer browserCancel()
+				found = true
 				break
 			}
+		}
+		if !found {
+			return account, errors.New("已连接的浏览器没有打开 Adobe 生图页面，请先打开并登录")
 		}
 	} else {
 		if err := chromedp.Do(browserCtx, chromedp.Navigate("about:blank")); err != nil {
@@ -199,31 +236,18 @@ func (a *App) refreshBrowser(ctx context.Context, account Account) (Account, err
 		case <-time.After(250 * time.Millisecond):
 		}
 	}
-	if account.UserID != "" && account.UserID != session.Profile.UserID {
-		return account, errors.New("浏览器登录账号与账号池记录不一致")
+	if err := validateBrowserSession(account, session); err != nil {
+		return account, err
 	}
-	cookies, err := chromedp.Call(browserCtx, storage.GetCookies, storage.GetCookiesParams{})
+	// 只导出 IMS 实际目标可发送的 Cookie，避免其他 Adobe 域的同名旧值覆盖登录。
+	cookies, err := chromedp.Call(browserCtx, network.GetCookies, network.GetCookiesParams{URLs: []string{adobeIMSURL}})
 	if err != nil {
 		return account, errors.New("读取更新后的 Cookie 失败")
 	}
-	values := map[string]string{}
-	for _, cookie := range cookies.Cookies {
-		domain := strings.TrimPrefix(cookie.Domain, ".")
-		if domain == "adobe.com" || strings.HasSuffix(domain, ".adobe.com") || domain == "adobelogin.com" || strings.HasSuffix(domain, ".adobelogin.com") {
-			values[cookie.Name] = cookie.Value
-		}
-	}
-	names := make([]string, 0, len(values))
-	for name := range values {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	var pairs []string
-	for _, name := range names {
-		pairs = append(pairs, name+"="+values[name])
-	}
-	if len(pairs) > 0 {
-		account.Cookie = strings.Join(pairs, "; ")
+	if cookie := browserCookieHeader(cookies.Cookies, adobeIMSURL); cookie != "" {
+		account.Cookie = cookie
+	} else {
+		return account, errors.New("浏览器没有可用于 Adobe 登录续期的 Cookie，请重新登录")
 	}
 	account.AccessToken = session.AccessToken
 	account.ARPSession = session.ARPSession
@@ -231,7 +255,8 @@ func (a *App) refreshBrowser(ctx context.Context, account Account) (Account, err
 	account.ExpiresAt = parseBrowserExpiry(session.ExpiresAt, session.AccessToken)
 	account.LastRefresh = time.Now().UTC()
 	account.LastError = ""
-	account.Status = "ready"
+	// 会话读取成功只表示拿到了凭据，真实生图成功后才标记账号可用。
+	account.Status = "unverified"
 	if account.Email == "" {
 		account.Email = session.Profile.Email
 	}
@@ -245,6 +270,77 @@ func (a *App) refreshBrowser(ctx context.Context, account Account) (Account, err
 		account.ClientID = "clio-playground-web"
 	}
 	return account, nil
+}
+
+// 同名 Cookie 优先采用目标域最具体的作用域，其次是更具体的路径，结果与返回顺序无关。
+func browserCookieHeader(cookies []*network.Cookie, targetURL string) string {
+	parsed, err := url.Parse(targetURL)
+	if err != nil || parsed.Hostname() == "" {
+		return ""
+	}
+	host := strings.ToLower(parsed.Hostname())
+	requestPath := parsed.Path
+	if requestPath == "" {
+		requestPath = "/"
+	}
+	selected := make(map[string]*network.Cookie)
+	now := float64(time.Now().Unix())
+	for _, cookie := range cookies {
+		if cookie == nil || !validCaptureCookie(cookie.Name, cookie.Value) || (cookie.Secure && parsed.Scheme != "https") || (!cookie.Session && cookie.Expires > 0 && cookie.Expires <= now) {
+			continue
+		}
+		domain := strings.ToLower(strings.TrimPrefix(cookie.Domain, "."))
+		if domain == "" || (host != domain && !(strings.HasPrefix(cookie.Domain, ".") && strings.HasSuffix(host, "."+domain))) {
+			continue
+		}
+		path := cookie.Path
+		if path == "" {
+			path = "/"
+		}
+		if requestPath != path && !(strings.HasPrefix(requestPath, path) && (strings.HasSuffix(path, "/") || (len(requestPath) > len(path) && requestPath[len(path)] == '/'))) {
+			continue
+		}
+		previous := selected[cookie.Name]
+		if previous == nil || browserCookieMoreSpecific(cookie, previous) {
+			selected[cookie.Name] = cookie
+		}
+	}
+	names := make([]string, 0, len(selected))
+	for name := range selected {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	pairs := make([]string, 0, len(names))
+	for _, name := range names {
+		pairs = append(pairs, name+"="+selected[name].Value)
+	}
+	return strings.Join(pairs, "; ")
+}
+
+func browserCookieMoreSpecific(current, previous *network.Cookie) bool {
+	currentDomain := strings.TrimPrefix(current.Domain, ".")
+	previousDomain := strings.TrimPrefix(previous.Domain, ".")
+	if len(currentDomain) != len(previousDomain) {
+		return len(currentDomain) > len(previousDomain)
+	}
+	currentPath, previousPath := current.Path, previous.Path
+	if currentPath == "" {
+		currentPath = "/"
+	}
+	if previousPath == "" {
+		previousPath = "/"
+	}
+	if len(currentPath) != len(previousPath) {
+		return len(currentPath) > len(previousPath)
+	}
+	if current.Secure != previous.Secure {
+		return current.Secure
+	}
+	if current.Expires != previous.Expires {
+		return current.Expires > previous.Expires
+	}
+	// 相同作用域通常只有一项，最后的固定排序防止分区等重复值造成随机覆盖。
+	return current.Value > previous.Value
 }
 
 // IMS 不同版本会返回日期、秒或毫秒时间戳，缺失时读取令牌中的有效期提示。

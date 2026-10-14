@@ -175,9 +175,13 @@ func TestAdobeRefreshReadsBalanceWithoutRepeatingBrowser(t *testing.T) {
 				browserCalls++
 				account.AccessToken = "refreshed-token"
 				account.ARPSession = "refreshed-arp"
+				account.Cookie = "ims_sid=browser-recovered"
 				return account, nil
 			}
 			client := &http.Client{Transport: adobeTestTransport(func(request *http.Request) (*http.Response, error) {
+				if request.URL.String() == adobeIMSURL {
+					return adobeTestResponse(200, nil, `{"access_token":"refreshed-token","userId":"user@AdobeID"}`), nil
+				}
 				balanceCalls++
 				if request.URL.String() != adobeCreditsURL || request.Header.Get("Authorization") != "Bearer refreshed-token" {
 					t.Fatal("刷新余额应使用新登录状态")

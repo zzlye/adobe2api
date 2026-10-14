@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +50,7 @@ func (a *App) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/admin/accounts", a.adminOnly(a.adminAccounts))
 	mux.HandleFunc("POST /api/admin/accounts", a.adminOnly(a.adminCreateAccount))
 	mux.HandleFunc("POST /api/admin/accounts/import", a.adminOnly(a.adminImportAccount))
+	mux.HandleFunc("POST /api/admin/accounts/browser", a.adminOnly(a.adminBrowserAccount))
 	mux.HandleFunc("PUT /api/admin/accounts/{id}", a.adminOnly(a.adminUpdateAccount))
 	mux.HandleFunc("DELETE /api/admin/accounts/{id}", a.adminOnly(a.adminDeleteAccount))
 	mux.HandleFunc("POST /api/admin/accounts/{id}/refresh", a.adminOnly(a.adminRefreshAccount))
@@ -379,9 +381,11 @@ func (a *App) adminCreateAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "账号名称或邮箱过长")
 		return
 	}
-	account.Status = "ready"
+	account.Status = "unverified"
 	if account.Cookie == "" && account.AccessToken == "" && account.RefreshToken == "" {
 		account.Status = "missing_credentials"
+	} else if account.AccessToken == "" || account.ARPSession == "" || account.UserID == "" {
+		account.Status = "pending"
 	}
 	if err := a.store.SaveAccount(account); err != nil {
 		writeError(w, http.StatusInternalServerError, "保存账号失败")
@@ -404,7 +408,11 @@ func (a *App) findAdminAccount(id string) (Account, error) {
 }
 
 func (a *App) adminUpdateAccount(w http.ResponseWriter, r *http.Request) {
-	var patch json.RawMessage
+	var patch struct {
+		Name    *string `json:"name"`
+		Enabled *bool   `json:"enabled"`
+		Cookie  string  `json:"cookie"`
+	}
 	if err := decodeAdminJSON(w, r, &patch, 2<<20); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -420,39 +428,29 @@ func (a *App) adminUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "账号不存在")
 		return
 	}
-	previous := account
-	// 在现有对象上解码，未提供的字段保持原值；空凭据也不会意外擦除登录。
-	if err := json.Unmarshal(patch, &account); err != nil {
-		writeError(w, http.StatusBadRequest, "账号内容无效")
-		return
+	// 空 Cookie 保留会话；同一登录仅换 Cookie，身份变化时清除旧凭据。
+	if patch.Name != nil {
+		account.Name = strings.TrimSpace(*patch.Name)
 	}
-	account.ID = previous.ID
-	if account.Cookie == "" {
-		account.Cookie = previous.Cookie
+	if patch.Enabled != nil {
+		account.Enabled = *patch.Enabled
 	}
-	if account.AccessToken == "" {
-		account.AccessToken = previous.AccessToken
-	}
-	if account.RefreshToken == "" {
-		account.RefreshToken = previous.RefreshToken
-	}
-	if account.ClientID == "" {
-		account.ClientID = previous.ClientID
-	}
-	if account.APIKey == "" {
-		account.APIKey = previous.APIKey
-	}
-	if account.ARPSession == "" {
-		account.ARPSession = previous.ARPSession
-	}
-	if account.Nonce == "" {
-		account.Nonce = previous.Nonce
-	}
-	if account.BrowserProfile == "" {
-		account.BrowserProfile = previous.BrowserProfile
-	}
-	if account.UserID == "" {
-		account.UserID = previous.UserID
+	if strings.TrimSpace(patch.Cookie) != "" {
+		cookie, email, err := parseAdminCookie(patch.Cookie)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if cookie != account.Cookie {
+			if sameAdobeCookieSession(account.Cookie, cookie) {
+				account.Cookie, account.Status, account.LastError = cookie, "pending", ""
+			} else {
+				account.Cookie, account.Email, account.UserID = cookie, email, ""
+				account.AccessToken, account.RefreshToken, account.ARPSession, account.Nonce, account.BrowserProfile = "", "", "", "", ""
+				account.ExpiresAt, account.LastRefresh = time.Time{}, time.Time{}
+				account.Credits, account.LastError, account.Status = nil, "", "pending"
+			}
+		}
 	}
 	account.Name = strings.TrimSpace(account.Name)
 	if account.Name == "" || len(account.Name) > 128 || len(account.Email) > 254 {
@@ -487,32 +485,277 @@ func (a *App) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 func (a *App) adminImportAccount(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Name    string `json:"name"`
+		Cookie  string `json:"cookie"`
 		Capture string `json:"capture"`
 	}
 	if err := decodeAdminJSON(w, r, &input, 8<<20); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	account, err := parseCapture(input.Capture)
+	var account Account
+	var err error
+	if strings.TrimSpace(input.Cookie) != "" {
+		account.Cookie, account.Email, err = parseAdminCookie(input.Cookie)
+		account.ClientID, account.APIKey = "clio-playground-web", "clio-playground-web"
+	} else {
+		// 保留早期抓包导入兼容，新的页面只需要提供 Cookie。
+		account, err = parseCapture(input.Capture)
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "没有找到可用的 Adobe 登录凭据")
 		return
 	}
-	account.ID = newID()
-	account.Name = strings.TrimSpace(input.Name)
-	if account.Name == "" {
-		account.Name = "Adobe 账号"
-	}
-	if len(account.Name) > 128 {
+	account.ID = ""
+	input.Name = strings.TrimSpace(input.Name)
+	if len(input.Name) > 128 {
 		writeError(w, http.StatusBadRequest, "账号名称过长")
 		return
 	}
-	account.Enabled, account.Status = true, "ready"
+	account.Enabled, account.Status = true, "pending"
+	if account.AccessToken != "" && account.ARPSession != "" && account.UserID != "" {
+		account.Status = "unverified"
+	}
+	a.poolMu.Lock()
+	defer a.poolMu.Unlock()
+	accounts, err := a.store.Accounts()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "读取账号池失败")
+		return
+	}
+	status := http.StatusCreated
+	for _, previous := range accounts {
+		if !(account.UserID != "" && account.UserID == previous.UserID) && !sameAdobeCookieSession(previous.Cookie, account.Cookie) {
+			continue
+		}
+		if a.busy[previous.ID] {
+			writeError(w, http.StatusConflict, "账号正在使用，请稍后导入")
+			return
+		}
+		// 同账号更新必须保留经真实生成使用的风险会话，只令 Cookie 触发 IMS 续期。
+		cookie := account.Cookie
+		account = previous
+		if cookie != "" {
+			account.Cookie = cookie
+		}
+		account.Status, account.LastError = "pending", ""
+		status = http.StatusOK
+		break
+	}
+	if account.ID == "" {
+		account.ID = newID()
+	}
+	if input.Name != "" {
+		account.Name = input.Name
+	}
+	if account.Name == "" {
+		account.Name = "Adobe 账号"
+	}
 	if err := a.store.SaveAccount(account); err != nil {
 		writeError(w, http.StatusInternalServerError, "导入账号失败")
 		return
 	}
-	writeJSON(w, http.StatusCreated, publicAdminAccount(account))
+	writeJSON(w, status, publicAdminAccount(account))
+}
+
+// Cookie 输入允许完整请求头或邮箱分隔行，保存前规范化，拒绝多行请求注入。
+func parseAdminCookie(raw string) (string, string, error) {
+	raw = strings.TrimSpace(strings.TrimPrefix(raw, "\ufeff"))
+	if len(raw) == 0 || len(raw) > 1<<20 || strings.ContainsAny(raw, "\r\n") {
+		return "", "", errors.New("请填写有效的 Cookie 文本")
+	}
+	var email string
+	if prefix, value, ok := strings.Cut(raw, "----"); ok {
+		email, raw = strings.TrimSpace(prefix), strings.TrimSpace(value)
+		if len(email) > 254 || !strings.Contains(email, "@") {
+			return "", "", errors.New("Cookie 前的邮箱无效")
+		}
+	}
+	if len(raw) >= len("Cookie:") && strings.EqualFold(raw[:len("Cookie:")], "Cookie:") {
+		raw = strings.TrimSpace(raw[len("Cookie:"):])
+	}
+	for _, pair := range strings.Split(raw, ";") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		name, value, ok := strings.Cut(pair, "=")
+		if !ok || !validCaptureCookie(name, value) {
+			return "", "", errors.New("Cookie 格式无效")
+		}
+	}
+	cookie := normalizedCaptureCookie(raw)
+	if cookie == "" {
+		return "", "", errors.New("没有找到有效的 Cookie")
+	}
+	return cookie, email, nil
+}
+
+func (a *App) adminBrowserAccount(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Name string `json:"name"`
+	}
+	if err := decodeAdminJSON(w, r, &input, 4096); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	input.Name = strings.TrimSpace(input.Name)
+	if len(input.Name) > 128 {
+		writeError(w, http.StatusBadRequest, "账号名称过长")
+		return
+	}
+	if strings.TrimSpace(os.Getenv("ADOBE2API_CDP_URL")) == "" {
+		writeError(w, http.StatusServiceUnavailable, "浏览器同步尚未连接，请配置已登录浏览器")
+		return
+	}
+	if a.generator == nil {
+		writeError(w, http.StatusServiceUnavailable, "浏览器同步暂不可用")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	// 空账号通过刷新适配器读取当前已登录页面；这里不创建登录页，也不导航用户页面。
+	account, err := a.generator.Refresh(ctx, Account{})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, safeError(err))
+		return
+	}
+	if account.Cookie == "" || account.AccessToken == "" || account.ARPSession == "" || account.UserID == "" {
+		writeError(w, http.StatusBadGateway, "浏览器没有返回完整的 Adobe 登录会话")
+		return
+	}
+	a.poolMu.Lock()
+	accounts, err := a.store.Accounts()
+	if err != nil {
+		a.poolMu.Unlock()
+		writeError(w, http.StatusInternalServerError, "读取账号池失败")
+		return
+	}
+	created := true
+	for _, previous := range accounts {
+		if previous.UserID != account.UserID && !(previous.UserID == "" && ((previous.Email != "" && strings.EqualFold(previous.Email, account.Email)) || sameAdobeCookieSession(previous.Cookie, account.Cookie))) {
+			continue
+		}
+		if a.busy[previous.ID] {
+			a.poolMu.Unlock()
+			writeError(w, http.StatusConflict, "账号正在使用，请稍后同步")
+			return
+		}
+		account.ID, account.Name, account.Enabled = previous.ID, previous.Name, previous.Enabled
+		// 显式同步以本次页面的风险会话为准，不能因续期清空错误而沿用失效的旧会话。
+		created = false
+		break
+	}
+	if created {
+		account.ID, account.Enabled = newID(), true
+	}
+	if a.busy == nil {
+		a.busy = make(map[string]bool)
+	}
+	a.busy[account.ID] = true
+	reservedID := account.ID
+	a.poolMu.Unlock()
+	defer func() {
+		a.poolMu.Lock()
+		delete(a.busy, reservedID)
+		a.poolMu.Unlock()
+	}()
+	// 页面令牌的权限可能不适合生图，再由真实 Cookie 换取 Firefly IMS 令牌。
+	refreshBase := account
+	account, err = a.generator.Refresh(ctx, refreshBase)
+	if err != nil {
+		failed := mergeConfirmedRefresh(refreshBase, account)
+		failed.Status, failed.LastError = "expired", safeError(err)
+		if failed.Name == "" {
+			failed.Name = "Adobe 账号"
+		}
+		if err := a.store.SaveAccount(failed); err != nil {
+			writeError(w, http.StatusInternalServerError, "保存续期登录信息失败")
+			return
+		}
+		writeError(w, http.StatusBadGateway, failed.LastError)
+		return
+	}
+	account.ID = reservedID
+	if account.AccessToken == "" || account.UserID == "" || account.ARPSession == "" {
+		writeError(w, http.StatusBadGateway, "Adobe 没有返回完整的生图登录会话")
+		return
+	}
+	if input.Name != "" {
+		account.Name = input.Name
+	}
+	if account.Name == "" {
+		account.Name = "Adobe 账号"
+	}
+	account.Status, account.LastError, account.LastRefresh = "unverified", "", time.Now().UTC()
+	account.Nonce = ""
+	if err := a.store.SaveAccount(account); err != nil {
+		writeError(w, http.StatusInternalServerError, "保存浏览器账号失败")
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, map[string]any{"account": publicAdminAccount(account), "created": created})
+}
+
+// 新导入账号尚无用户标识时，用同一登录会话去重，其他统计 Cookie 不参与身份判断。
+func sameAdobeCookieSession(previous, current string) bool {
+	if previous == "" || current == "" {
+		return false
+	}
+	first := (&http.Request{Header: http.Header{"Cookie": {previous}}}).Cookies()
+	second := &http.Request{Header: http.Header{"Cookie": {current}}}
+	for _, cookie := range first {
+		if cookie.Name != "ims_sid" && cookie.Name != "sso_sid" {
+			continue
+		}
+		other, err := second.Cookie(cookie.Name)
+		if err == nil && cookie.Value != "" && cookie.Value == other.Value {
+			return true
+		}
+	}
+	return false
+}
+
+// 续期后半程失败也保留已确认同账号的轮换凭据，不接受空账号或其他用户的返回值。
+func mergeConfirmedRefresh(original, partial Account) Account {
+	if original.ID == "" || partial.ID != original.ID || partial.UserID == "" {
+		return original
+	}
+	if expected := adobeUserID(original); expected != "" && expected != partial.UserID {
+		return original
+	}
+	if tokenUser := adobeUserID(Account{AccessToken: partial.AccessToken}); tokenUser != "" && tokenUser != partial.UserID {
+		return original
+	}
+	merged := original
+	merged.UserID = partial.UserID
+	if partial.Cookie != "" {
+		merged.Cookie = partial.Cookie
+	}
+	if partial.AccessToken != "" {
+		merged.AccessToken, merged.ExpiresAt = partial.AccessToken, partial.ExpiresAt
+	}
+	if partial.RefreshToken != "" {
+		merged.RefreshToken = partial.RefreshToken
+	}
+	if partial.ClientID != "" {
+		merged.ClientID = partial.ClientID
+	}
+	if partial.APIKey != "" {
+		merged.APIKey = partial.APIKey
+	}
+	if merged.ARPSession == "" && partial.ARPSession != "" {
+		merged.ARPSession = partial.ARPSession
+	}
+	if merged.Email == "" && partial.Email != "" {
+		merged.Email = partial.Email
+	}
+	if !partial.LastRefresh.IsZero() {
+		merged.LastRefresh = partial.LastRefresh
+	}
+	return merged
 }
 
 func (a *App) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
@@ -546,13 +789,19 @@ func (a *App) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	updated, err := a.generator.Refresh(ctx, account)
 	if err != nil {
-		account.Status, account.LastError = "expired", "登录刷新失败，请重新登录或导入账号"
+		account = mergeConfirmedRefresh(account, updated)
+		account.Status, account.LastError = "expired", safeError(err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			account.LastError = "登录刷新超时，请稍后重试"
+		} else if errors.Is(err, context.Canceled) {
+			account.LastError = "登录刷新已取消"
+		}
 		_ = a.store.SaveAccount(account)
 		writeError(w, http.StatusBadGateway, account.LastError)
 		return
 	}
 	updated.ID, updated.LastRefresh = account.ID, time.Now().UTC()
-	updated.LastError, updated.Status = "", "ready"
+	updated.LastError, updated.Status = "", "unverified"
 	if err := a.store.SaveAccount(updated); err != nil {
 		writeError(w, http.StatusInternalServerError, "保存刷新结果失败")
 		return
@@ -572,7 +821,7 @@ func (a *App) adminLogs(w http.ResponseWriter, r *http.Request) {
 	if limit < 1 || limit > 100 {
 		limit = 20
 	}
-	items, total, err := a.store.Logs(page, limit, r.URL.Query().Get("status"), r.URL.Query().Get("q"))
+	items, total, err := a.store.LogSummaries(page, limit, r.URL.Query().Get("status"), r.URL.Query().Get("q"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "读取日志失败")
 		return
