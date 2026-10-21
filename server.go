@@ -26,19 +26,23 @@ import (
 //go:embed web/*
 var frontend embed.FS
 
-// App 的并发计数同时约束请求总量及单账号任务，避免重复扣费和失控排队。
+// App 的并发计数同时约束请求总量、单账号任务与每分钟请求上限，避免重复扣费和失控排队。
 type App struct {
-	store     *Store
-	generator Generator
-	adminAuth *adminAuth
-	poolMu    sync.Mutex
-	busy      map[string]bool
-	active    int
-	next      int
-	inputOnce sync.Once
-	inputGate chan struct{}
-	jobs      sync.WaitGroup
+	store           *Store
+	generator       Generator
+	adminAuth       *adminAuth
+	poolMu          sync.Mutex
+	busy            map[string]bool
+	activeByAccount map[string]int
+	requestHistory  map[string][]time.Time
+	active          int
+	next            int
+	inputOnce       sync.Once
+	inputGate       chan struct{}
+	jobs            sync.WaitGroup
 }
+
+var errRateLimited = errors.New("当前请求已超过并发或单账号每分钟请求上限，请稍后重试")
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -148,24 +152,68 @@ func (a *App) apiOnly(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// accountAvailableLocked 同时检查账号启用状态、后台刷新占用与一分钟滑动窗口内的请求配额。
+func (a *App) accountAvailableLocked(account Account, now time.Time) bool {
+	if !account.Enabled {
+		return false
+	}
+	inFlight := a.activeByAccount[account.ID]
+	if a.busy[account.ID] && inFlight == 0 {
+		return false
+	}
+	history := a.requestHistory[account.ID]
+	valid := history[:0]
+	for _, ts := range history {
+		if now.Sub(ts) < time.Minute {
+			valid = append(valid, ts)
+		}
+	}
+	if len(valid) == 0 {
+		delete(a.requestHistory, account.ID)
+	} else {
+		a.requestHistory[account.ID] = valid
+	}
+	if account.RequestsPerMinute > 0 {
+		return len(valid) < account.RequestsPerMinute && inFlight < account.RequestsPerMinute
+	}
+	return !a.busy[account.ID] && inFlight == 0
+}
+
 func (a *App) reserveAccount() (Account, func(), error) {
 	a.poolMu.Lock()
 	defer a.poolMu.Unlock()
-	if a.active >= a.store.Settings().MaxConcurrent {
-		return Account{}, nil, errors.New("当前生成任务已满，请稍后重试")
-	}
 	accounts, err := a.store.Accounts()
 	if err != nil {
 		return Account{}, nil, err
 	}
+	hasEnabled := false
+	for _, account := range accounts {
+		if account.Enabled {
+			hasEnabled = true
+			break
+		}
+	}
+	if !hasEnabled {
+		return Account{}, nil, errors.New("暂无可用账号，请检查账号池")
+	}
+	if a.active >= a.store.Settings().MaxConcurrent {
+		return Account{}, nil, errRateLimited
+	}
 	if a.busy == nil {
 		a.busy = make(map[string]bool)
 	}
-	// 先从全部空闲启用账号中均匀抽样，不能随机起点后顺延造成权重偏差。
+	if a.activeByAccount == nil {
+		a.activeByAccount = make(map[string]int)
+	}
+	if a.requestHistory == nil {
+		a.requestHistory = make(map[string][]time.Time)
+	}
+	now := time.Now()
+	// 先从全部可接收请求的启用账号中均匀抽样，不能随机起点后顺延造成权重偏差。
 	if a.store.Settings().AccountStrategy == "random" {
 		candidates := make([]int, 0, len(accounts))
 		for i, account := range accounts {
-			if account.Enabled && !a.busy[account.ID] {
+			if a.accountAvailableLocked(account, now) {
 				candidates = append(candidates, i)
 			}
 		}
@@ -176,15 +224,28 @@ func (a *App) reserveAccount() (Account, func(), error) {
 	for i := 0; i < len(accounts); i++ {
 		index := (a.next + i) % len(accounts)
 		account := accounts[index]
-		if !account.Enabled || a.busy[account.ID] {
+		if !a.accountAvailableLocked(account, now) {
 			continue
 		}
 		a.next = index + 1
 		a.active++
+		a.activeByAccount[account.ID]++
 		a.busy[account.ID] = true
-		return account, func() { a.poolMu.Lock(); delete(a.busy, account.ID); a.active--; a.poolMu.Unlock() }, nil
+		if account.RequestsPerMinute > 0 {
+			a.requestHistory[account.ID] = append(a.requestHistory[account.ID], now)
+		}
+		return account, func() {
+			a.poolMu.Lock()
+			a.activeByAccount[account.ID]--
+			if a.activeByAccount[account.ID] <= 0 {
+				delete(a.activeByAccount, account.ID)
+				delete(a.busy, account.ID)
+			}
+			a.active--
+			a.poolMu.Unlock()
+		}, nil
 	}
-	return Account{}, nil, errors.New("暂无可用账号，请检查账号池")
+	return Account{}, nil, errRateLimited
 }
 
 func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, endpoint string) (GenerateResult, RequestLog, error) {
@@ -224,10 +285,20 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 	entry.Parameters = input.parameterJSON()
 	account, release, err := a.reserveAccount()
 	if err != nil {
-		entry.HTTPStatus = 503
+		if errors.Is(err, errRateLimited) {
+			entry.HTTPStatus = http.StatusTooManyRequests
+		} else {
+			entry.HTTPStatus = http.StatusServiceUnavailable
+		}
 		return finish(GenerateResult{}, err)
 	}
 	defer release()
+	saveAccountState := func(acc Account) error {
+		if current, findErr := a.findAdminAccount(acc.ID); findErr == nil {
+			acc.Name, acc.Enabled, acc.RequestsPerMinute = current.Name, current.Enabled, current.RequestsPerMinute
+		}
+		return a.store.SaveAccount(acc)
+	}
 	entry.AccountID = account.ID
 	entry.AccountName = account.Name
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(a.store.Settings().RequestTimeoutSeconds)*time.Second)
@@ -241,12 +312,12 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 			account = mergeConfirmedRefresh(account, refreshed)
 			account.LastError = safeError(err)
 			account.Status = "expired"
-			_ = a.store.SaveAccount(account)
+			_ = saveAccountState(account)
 			entry.HTTPStatus = 503
 			return finish(GenerateResult{}, err)
 		}
 		account = refreshed
-		if err := a.store.SaveAccount(account); err != nil {
+		if err := saveAccountState(account); err != nil {
 			return finish(GenerateResult{}, err)
 		}
 	}
@@ -262,12 +333,12 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 				account.Status = "expired"
 			}
 		}
-		_ = a.store.SaveAccount(account)
+		_ = saveAccountState(account)
 	} else {
 		// 只有真实生成成功才标记可用，令牌续期不代表生图能力已验证。
 		account.LastError = ""
 		account.Status = "ready"
-		_ = a.store.SaveAccount(account)
+		_ = saveAccountState(account)
 	}
 	return finish(result, err)
 }

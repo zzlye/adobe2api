@@ -40,8 +40,9 @@ type Account struct {
 	LastRefresh    time.Time `json:"last_refresh"`
 	Status         string    `json:"status"`
 	LastError      string    `json:"last_error"`
-	Credits        *float64  `json:"credits"`
-	BrowserProfile string    `json:"browser_profile,omitempty"`
+	Credits           *float64  `json:"credits"`
+	RequestsPerMinute int       `json:"requests_per_minute"`
+	BrowserProfile    string    `json:"browser_profile,omitempty"`
 }
 
 // ImageRecord 只保存文件元信息，图片本体按需从磁盘读取。

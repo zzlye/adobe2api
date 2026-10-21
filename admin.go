@@ -381,6 +381,10 @@ func (a *App) adminCreateAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "账号名称或邮箱过长")
 		return
 	}
+	if account.RequestsPerMinute < 0 || account.RequestsPerMinute > 600 {
+		writeError(w, http.StatusBadRequest, "单账号每分钟请求数应为 0 至 600")
+		return
+	}
 	account.Status = "unverified"
 	if account.Cookie == "" && account.AccessToken == "" && account.RefreshToken == "" {
 		account.Status = "missing_credentials"
@@ -409,17 +413,22 @@ func (a *App) findAdminAccount(id string) (Account, error) {
 
 func (a *App) adminUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	var patch struct {
-		Name    *string `json:"name"`
-		Enabled *bool   `json:"enabled"`
-		Cookie  string  `json:"cookie"`
+		Name              *string `json:"name"`
+		Enabled           *bool   `json:"enabled"`
+		RequestsPerMinute *int    `json:"requests_per_minute"`
+		Cookie            string  `json:"cookie"`
 	}
 	if err := decodeAdminJSON(w, r, &patch, 2<<20); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if patch.RequestsPerMinute != nil && (*patch.RequestsPerMinute < 0 || *patch.RequestsPerMinute > 600) {
+		writeError(w, http.StatusBadRequest, "单账号每分钟请求数应为 0 至 600")
+		return
+	}
 	a.poolMu.Lock()
 	defer a.poolMu.Unlock()
-	if a.busy[r.PathValue("id")] {
+	if a.busy[r.PathValue("id")] && (patch.Name != nil || patch.Enabled != nil || strings.TrimSpace(patch.Cookie) != "") {
 		writeError(w, http.StatusConflict, "账号正在使用，请稍后修改")
 		return
 	}
@@ -434,6 +443,9 @@ func (a *App) adminUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	if patch.Enabled != nil {
 		account.Enabled = *patch.Enabled
+	}
+	if patch.RequestsPerMinute != nil {
+		account.RequestsPerMinute = *patch.RequestsPerMinute
 	}
 	if strings.TrimSpace(patch.Cookie) != "" {
 		cookie, email, err := parseAdminCookie(patch.Cookie)
@@ -484,12 +496,17 @@ func (a *App) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) adminImportAccount(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Name    string `json:"name"`
-		Cookie  string `json:"cookie"`
-		Capture string `json:"capture"`
+		Name              string `json:"name"`
+		Cookie            string `json:"cookie"`
+		Capture           string `json:"capture"`
+		RequestsPerMinute *int   `json:"requests_per_minute"`
 	}
 	if err := decodeAdminJSON(w, r, &input, 8<<20); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if input.RequestsPerMinute != nil && (*input.RequestsPerMinute < 0 || *input.RequestsPerMinute > 600) {
+		writeError(w, http.StatusBadRequest, "单账号每分钟请求数应为 0 至 600")
 		return
 	}
 	var account Account
@@ -547,6 +564,9 @@ func (a *App) adminImportAccount(w http.ResponseWriter, r *http.Request) {
 	if input.Name != "" {
 		account.Name = input.Name
 	}
+	if input.RequestsPerMinute != nil {
+		account.RequestsPerMinute = *input.RequestsPerMinute
+	}
 	if account.Name == "" {
 		account.Name = "Adobe 账号"
 	}
@@ -592,10 +612,15 @@ func parseAdminCookie(raw string) (string, string, error) {
 
 func (a *App) adminBrowserAccount(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Name string `json:"name"`
+		Name              string `json:"name"`
+		RequestsPerMinute *int   `json:"requests_per_minute"`
 	}
 	if err := decodeAdminJSON(w, r, &input, 4096); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if input.RequestsPerMinute != nil && (*input.RequestsPerMinute < 0 || *input.RequestsPerMinute > 600) {
+		writeError(w, http.StatusBadRequest, "单账号每分钟请求数应为 0 至 600")
 		return
 	}
 	input.Name = strings.TrimSpace(input.Name)
@@ -640,13 +665,16 @@ func (a *App) adminBrowserAccount(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "账号正在使用，请稍后同步")
 			return
 		}
-		account.ID, account.Name, account.Enabled = previous.ID, previous.Name, previous.Enabled
+		account.ID, account.Name, account.Enabled, account.RequestsPerMinute = previous.ID, previous.Name, previous.Enabled, previous.RequestsPerMinute
 		// 显式同步以本次页面的风险会话为准，不能因续期清空错误而沿用失效的旧会话。
 		created = false
 		break
 	}
 	if created {
 		account.ID, account.Enabled = newID(), true
+	}
+	if input.RequestsPerMinute != nil {
+		account.RequestsPerMinute = *input.RequestsPerMinute
 	}
 	if a.busy == nil {
 		a.busy = make(map[string]bool)
@@ -676,6 +704,7 @@ func (a *App) adminBrowserAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	account.ID = reservedID
+	account.RequestsPerMinute = refreshBase.RequestsPerMinute
 	if account.AccessToken == "" || account.UserID == "" || account.ARPSession == "" {
 		writeError(w, http.StatusBadGateway, "Adobe 没有返回完整的生图登录会话")
 		return
@@ -800,7 +829,7 @@ func (a *App) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, account.LastError)
 		return
 	}
-	updated.ID, updated.LastRefresh = account.ID, time.Now().UTC()
+	updated.ID, updated.LastRefresh, updated.RequestsPerMinute = account.ID, time.Now().UTC(), account.RequestsPerMinute
 	updated.LastError, updated.Status = "", "unverified"
 	if err := a.store.SaveAccount(updated); err != nil {
 		writeError(w, http.StatusInternalServerError, "保存刷新结果失败")

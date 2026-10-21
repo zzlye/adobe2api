@@ -360,8 +360,25 @@ function renderAccounts() {
       try { await api(`/api/admin/accounts/${encodeURIComponent(account.id)}`, { method: 'PUT', body: { enabled: !account.enabled } }); account.enabled = !account.enabled; renderAccounts(); toast(account.enabled ? '账号已启用' : '账号已停用'); }
       catch (error) { toast(errorMessage(error), true); toggle.disabled = false; }
     } });
+    // 账号列表支持直接调整单账号每分钟请求上限，修改后即时持久化。
+    const rpmInput = el('input', { type: 'number', min: '0', max: '600', value: String(account.requests_per_minute || 0), 'aria-label': `${account.name || '账号'}每分钟请求上限`, onchange: async () => {
+      const nextValue = Math.max(0, Math.min(600, Math.trunc(Number(rpmInput.value || 0))));
+      rpmInput.value = String(nextValue);
+      rpmInput.disabled = true;
+      try {
+        await api(`/api/admin/accounts/${encodeURIComponent(account.id)}`, { method: 'PUT', body: { requests_per_minute: nextValue } });
+        account.requests_per_minute = nextValue;
+        toast('每分钟请求上限已更新');
+      } catch (error) {
+        rpmInput.value = String(account.requests_per_minute || 0);
+        toast(errorMessage(error), true);
+      } finally {
+        rpmInput.disabled = false;
+      }
+    } });
+    const rpmField = el('div', { class: 'input-unit rpm-unit' }, rpmInput, el('span', { text: '次/分' }));
     const refresh = el('button', { class: 'icon-button', title: '刷新登录', 'aria-label': '刷新登录', onclick: () => refreshAccount(account, refresh) }, icon('refresh'));
-    return el('tr', {}, el('td', {}, el('div', { class: 'account-identity' }, el('span', { class: 'avatar', text: (account.name || account.email || 'A').slice(0, 1).toUpperCase() }), el('div', {}, el('div', { class: 'account-name', text: account.name || '未命名账号' }), el('div', { class: 'account-email', text: account.email || '—' })))), el('td', { title: account.last_error || '' }, statusBadge(account.enabled ? account.status : 'disabled')), el('td', { text: count(account.credits, 2) }), el('td', { text: date(account.last_refresh, true) }), el('td', {}, toggle), el('td', {}, el('div', { class: 'table-actions' }, refresh, el('button', { class: 'icon-button', title: '编辑账号', 'aria-label': '编辑账号', onclick: () => openAccount(account) }, icon('edit')), el('button', { class: 'icon-button danger', title: '删除账号', 'aria-label': '删除账号', onclick: () => deleteAccount(account) }, icon('trash')))));
+    return el('tr', {}, el('td', {}, el('div', { class: 'account-identity' }, el('span', { class: 'avatar', text: (account.name || account.email || 'A').slice(0, 1).toUpperCase() }), el('div', {}, el('div', { class: 'account-name', text: account.name || '未命名账号' }), el('div', { class: 'account-email', text: account.email || '—' })))), el('td', { title: account.last_error || '' }, statusBadge(account.enabled ? account.status : 'disabled')), el('td', { text: count(account.credits, 2) }), el('td', {}, rpmField), el('td', { text: date(account.last_refresh, true) }), el('td', {}, toggle), el('td', {}, el('div', { class: 'table-actions' }, refresh, el('button', { class: 'icon-button', title: '编辑账号', 'aria-label': '编辑账号', onclick: () => openAccount(account) }, icon('edit')), el('button', { class: 'icon-button danger', title: '删除账号', 'aria-label': '删除账号', onclick: () => deleteAccount(account) }, icon('trash')))));
   }));
 }
 async function refreshAccount(account, button) {
@@ -393,6 +410,9 @@ function openAccount(account = null) {
   const form = $('#account-form');
   if (account) {
     form.elements.name.value = account.name || '';
+    form.elements.requests_per_minute.value = String(account.requests_per_minute || 0);
+  } else {
+    form.elements.requests_per_minute.value = '0';
   }
   form.elements.name.placeholder = account ? '账号名称' : '留空自动命名';
   form.elements.cookie.placeholder = account ? '留空保留当前 Cookie' : '粘贴已登录账号的 Cookie';
@@ -674,7 +694,8 @@ $('#account-form').addEventListener('submit', async event => {
   event.preventDefault();
   if (state.accountSubmitting) return;
   const form = event.currentTarget;
-  const body = { name: form.elements.name.value.trim() };
+  const rpm = Math.max(0, Math.min(600, Math.trunc(Number(form.elements.requests_per_minute?.value || 0))));
+  const body = { name: form.elements.name.value.trim(), requests_per_minute: rpm };
   if (state.accountEdit && !body.name) { form.elements.name.focus(); return; }
   if (state.accountMode === 'cookie') {
     const cookie = form.elements.cookie.value.trim();

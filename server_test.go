@@ -96,3 +96,48 @@ func TestLargeImageInputAdmissionIsBoundedAndReleased(t *testing.T) {
 		t.Fatalf("解析名额未恢复: %d %s", response.Code, response.Body.String())
 	}
 }
+
+// 单账号每分钟请求上限超出时直接返回 429，无启用账号时保持 503。
+func TestAccountRequestsPerMinuteAndRateLimit429(t *testing.T) {
+	app, handler, cookie, generator := cookieAdminTestApp(t)
+	generator.image = storageTestPNG(t)
+	response := adminTestRequest(handler, "POST", "/api/admin/accounts/import", `{"name":"限流账号","cookie":"ims_sid=rpm-session; sso_sid=rpm-sso","requests_per_minute":1}`, cookie, "")
+	if response.Code != 201 || !strings.Contains(response.Body.String(), `"requests_per_minute":1`) {
+		t.Fatalf("导入时每分钟请求上限未保存: %d %s", response.Code, response.Body.String())
+	}
+	accounts, err := app.store.Accounts()
+	if err != nil || len(accounts) != 1 || accounts[0].RequestsPerMinute != 1 {
+		t.Fatal("数据库中每分钟请求上限不一致")
+	}
+	callGen := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/v1/images/generations", strings.NewReader(`{"model":"nano-banana-2","prompt":"限流测试"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+app.store.Settings().APIKeys[0])
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := callGen(); rec.Code != 200 {
+		t.Fatalf("首次请求应成功: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := callGen(); rec.Code != 429 {
+		t.Fatalf("超过单账号每分钟请求上限应返回 429，实际: %d %s", rec.Code, rec.Body.String())
+	}
+	// 在账号列表直接调高每分钟请求上限后应立即放行。
+	update := adminTestRequest(handler, "PUT", "/api/admin/accounts/"+accounts[0].ID, `{"requests_per_minute":2}`, cookie, "")
+	if update.Code != 200 || !strings.Contains(update.Body.String(), `"requests_per_minute":2`) {
+		t.Fatalf("更新每分钟请求上限失败: %d %s", update.Code, update.Body.String())
+	}
+	if rec := callGen(); rec.Code != 200 {
+		t.Fatalf("调高每分钟请求上限后应放行第二次请求: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := callGen(); rec.Code != 429 {
+		t.Fatalf("再次超过每分钟上限应返回 429: %d %s", rec.Code, rec.Body.String())
+	}
+	// 停用全部账号时返回 503。
+	adminTestRequest(handler, "PUT", "/api/admin/accounts/"+accounts[0].ID, `{"enabled":false}`, cookie, "")
+	if rec := callGen(); rec.Code != 503 {
+		t.Fatalf("无启用账号时应返回 503: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
