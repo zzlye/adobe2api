@@ -44,6 +44,17 @@ func validateInput(input *GenerateInput) error {
 	if input.Quality == "" {
 		input.Quality = "auto"
 	}
+	switch strings.ToLower(strings.TrimSpace(input.Quality)) {
+	case "xhigh":
+		input.Quality = "max"
+	case "hd":
+		input.Quality = "high"
+	case "standard":
+		input.Quality = "medium"
+	}
+	if strings.Contains(input.Size, ":") && input.AspectRatio == "" {
+		input.AspectRatio, input.Size = strings.TrimSpace(input.Size), ""
+	}
 	ratio, resolution, _, _, err := adobeParameters(model, *input)
 	if err != nil {
 		return err
@@ -404,6 +415,17 @@ type imageProtocolInput struct {
 	Images         []imageURLInput `json:"images"`
 	Image          json.RawMessage `json:"image"`
 	OutputFormat   string          `json:"output_format"`
+	AspectRatioAlt string          `json:"aspectRatio"`
+	ImageSizeAlt   string          `json:"imageSize"`
+}
+
+func validOutputFormat(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "png", "jpeg", "jpg", "webp":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *App) imageJSON(w http.ResponseWriter, r *http.Request) (imageProtocolInput, error) {
@@ -411,8 +433,14 @@ func (a *App) imageJSON(w http.ResponseWriter, r *http.Request) (imageProtocolIn
 	if err := decodeProtocolJSON(w, r, &input); err != nil {
 		return input, err
 	}
-	if input.OutputFormat != "" {
-		return input, errors.New("当前接口不支持指定输出文件格式")
+	if !validOutputFormat(input.OutputFormat) {
+		return input, errors.New("output_format 仅支持 png、jpeg、webp")
+	}
+	if input.AspectRatio == "" && input.AspectRatioAlt != "" {
+		input.AspectRatio = input.AspectRatioAlt
+	}
+	if input.Resolution == "" && input.ImageSizeAlt != "" {
+		input.Resolution = input.ImageSizeAlt
 	}
 	if err := a.resolveMask(r, &input.GenerateInput); err != nil {
 		return input, err
@@ -549,9 +577,9 @@ func (a *App) imageMultipart(w http.ResponseWriter, r *http.Request) (imageProto
 			input.Prompt = value
 		case "size":
 			input.Size = value
-		case "aspect_ratio":
+		case "aspect_ratio", "aspectRatio":
 			input.AspectRatio = value
-		case "resolution":
+		case "resolution", "imageSize":
 			input.Resolution = value
 		case "quality":
 			input.Quality = value
@@ -591,9 +619,10 @@ func (a *App) imageMultipart(w http.ResponseWriter, r *http.Request) (imageProto
 				return input, errors.New("生成数量无效")
 			}
 		case "output_format":
-			if value != "" {
-				return input, errors.New("当前接口不支持指定输出文件格式")
+			if !validOutputFormat(value) {
+				return input, errors.New("output_format 仅支持 png、jpeg、webp")
 			}
+			input.OutputFormat = value
 		case "image", "image[]":
 			return input, errors.New("参考图应上传为文件")
 		}

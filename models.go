@@ -39,8 +39,22 @@ func init() {
 }
 
 func resolveModel(id string) (Model, bool) {
-	id = strings.TrimPrefix(id, "models/")
-	aliases := map[string]string{"nano-banana-2": "gemini-3.1-flash-image-preview", "gemini-3.1-flash-image": "gemini-3.1-flash-image-preview", "nano-banana-pro": "gemini-3-pro-image-preview", "gemini-3-pro-image": "gemini-3-pro-image-preview", "gpt-image-2.5-prism": "gpt-image-2.5-sunburst"}
+	id = strings.TrimSpace(strings.TrimPrefix(id, "models/"))
+	// 兼容网关渠道转发时附带的上下游前缀与规格后缀。
+	for _, prefix := range []string{"xia-", "xin-"} {
+		id = strings.TrimPrefix(id, prefix)
+	}
+	for _, suffix := range []string{"-满血", "-官渠", "-专线", "-vip", "-4k", "-4K", "-2k", "-2K", "-1k", "-1K"} {
+		id = strings.TrimSuffix(id, suffix)
+	}
+	aliases := map[string]string{
+		"nano-banana-2":          "gemini-3.1-flash-image-preview",
+		"nano-banana-2.1":        "gemini-3.1-flash-image-preview",
+		"gemini-3.1-flash-image": "gemini-3.1-flash-image-preview",
+		"nano-banana-pro":        "gemini-3-pro-image-preview",
+		"gemini-3-pro-image":     "gemini-3-pro-image-preview",
+		"gpt-image-2.5-prism":    "gpt-image-2.5-sunburst",
+	}
 	if alias, ok := aliases[id]; ok {
 		id = alias
 	}

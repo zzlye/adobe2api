@@ -369,3 +369,43 @@ func TestGeminiSearchSeedAndMultipartRejectMalformedOptions(t *testing.T) {
 		t.Fatal("扩展参数日志无效或泄露凭据")
 	}
 }
+
+// 兼容网关渠道别名、output_format 及扩展画质参数。
+func TestGatewayCompatibleOutputFormatAndModelAliases(t *testing.T) {
+	app, fake, data := newProtocolApp(t)
+	body := map[string]any{
+		"model":         "gpt-image-2.5-sunburst-满血",
+		"prompt":        "中转渠道兼容性测试",
+		"size":          "3840x2160",
+		"quality":       "xhigh",
+		"background":    "transparent",
+		"output_format": "png",
+		"moderation":    "auto",
+	}
+	requireProtocolStatus(t, protocolRequest(app, "POST", "/v1/images/generations", body), 200)
+	if fake.input.Model != "gpt-image-2.5-sunburst" || fake.input.Quality != "max" || fake.input.Background != "transparent" {
+		t.Fatalf("网关文生图参数映射错误: %+v", fake.input)
+	}
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	_ = writer.WriteField("model", "xia-gpt-image-2.5-flare-官渠")
+	_ = writer.WriteField("prompt", "中转渠道图生图测试")
+	_ = writer.WriteField("size", "2880x2880")
+	_ = writer.WriteField("quality", "max")
+	_ = writer.WriteField("background", "transparent")
+	_ = writer.WriteField("output_format", "png")
+	_ = writer.WriteField("moderation", "auto")
+	part, _ := writer.CreateFormFile("image[]", "input-1.png")
+	_, _ = part.Write(data)
+	_ = writer.Close()
+	req := httptest.NewRequest("POST", "/v1/images/edits", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer sk-protocol-test-12345")
+	rec := httptest.NewRecorder()
+	app.Handler().ServeHTTP(rec, req)
+	requireProtocolStatus(t, rec, 200)
+	if fake.input.Model != "gpt-image-2.5-flare" || fake.input.Quality != "max" || fake.input.Resolution != "4K" {
+		t.Fatalf("网关图生图参数映射错误: %+v", fake.input)
+	}
+}
+
