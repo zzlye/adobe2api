@@ -1,0 +1,27 @@
+services:
+  adobe2api:
+    image: ${ADOBE2API_IMAGE:-ghcr.io/zzlye/adobe2api:latest}
+    container_name: adobe2api
+    restart: unless-stopped
+    ports:
+      - "${ADOBE2API_PORT:-8080}:8080"
+    environment:
+      ADOBE2API_ADDR: ":8080"
+      ADOBE2API_DATA_DIR: /app/data
+      ADOBE2API_CHROME: /usr/bin/chromium
+      ADOBE2API_CHROME_NO_SANDBOX: "1"
+      GOMEMLIMIT: 256MiB
+      # 浏览器临时资料随应用数据放在指定磁盘，避免占用系统盘。
+      TMPDIR: /app/data/tmp
+      HOME: /app/data/home
+    volumes:
+      - ${ADOBE2API_DATA_PATH:-./data}:/app/data
+    shm_size: 256mb
+    init: true
+    stop_grace_period: 30s
+    # 限制容器运行日志占用，不影响后台保存的生成记录。
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
