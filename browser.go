@@ -155,7 +155,19 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 		}
 		defer os.RemoveAll(profile)
 		options := append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
-		options = append(options, chromedp.UserDataDir(profile), chromedp.Flag("disable-dev-shm-usage", true), chromedp.Flag("disk-cache-size", "8388608"), chromedp.Flag("media-cache-size", "1048576"), chromedp.Flag("disable-gpu", true))
+		// 隐藏自动化标识与无头 User-Agent，降低无头浏览器触发 Arkose 风控（rid=100）的概率。
+		options = append(options,
+			chromedp.UserDataDir(profile),
+			chromedp.Flag("headless", "new"),
+			chromedp.Flag("enable-automation", false),
+			chromedp.Flag("disable-blink-features", "AutomationControlled"),
+			chromedp.WindowSize(1920, 1080),
+			chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"),
+			chromedp.Flag("disable-dev-shm-usage", true),
+			chromedp.Flag("disk-cache-size", "8388608"),
+			chromedp.Flag("media-cache-size", "1048576"),
+			chromedp.Flag("disable-gpu", true),
+		)
 		if path := os.Getenv("ADOBE2API_CHROME"); path != "" {
 			options = append(options, chromedp.ExecPath(path))
 		}
@@ -198,6 +210,9 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 		if err := chromedp.Do(browserCtx, chromedp.Navigate("about:blank")); err != nil {
 			return account, fmt.Errorf("启动续期浏览器失败: %w", err)
 		}
+		_, _ = chromedp.Call(browserCtx, page.AddScriptToEvaluateOnNewDocument, page.AddScriptToEvaluateOnNewDocumentParams{
+			Source: `Object.defineProperty(navigator,'webdriver',{get:()=>false});window.chrome=window.chrome||{runtime:{}};`,
+		})
 		request := &http.Request{Header: http.Header{"Cookie": []string{account.Cookie}}}
 		// 原始 Cookie 文本没有域信息，将 Adobe SSO Cookie 写入其实际认证域。
 		for _, cookie := range request.Cookies() {

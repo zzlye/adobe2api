@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"testing"
@@ -125,3 +126,16 @@ func TestAdobeBrowserCookieRecoveryUsesCurrentARP(t *testing.T) {
 		t.Fatal("浏览器恢复未采用本次风险会话，或沿用了页面缓存令牌")
 	}
 }
+
+// 浏览器完整 Cookie 中的有效 sherlockToken 可直接作为风险会话，被风控标记（rid=100）的令牌必须忽略。
+func TestCookieARPSessionExtractsValidSherlockTokenAndRejectsFlaggedRisk(t *testing.T) {
+	validSherlock := base64.StdEncoding.EncodeToString([]byte(`{"sid":"valid-sid","ftr":"valid-ftr","ark":"token|rid=65|ag=101","bfp":"valid-bfp"}`))
+	flaggedSherlock := base64.StdEncoding.EncodeToString([]byte(`{"sid":"flagged-sid","ftr":"valid-ftr","ark":"token|rid=100|ag=101","bfp":"valid-bfp"}`))
+	if got := cookieARPSession("ims_sid=s1; sherlockToken=" + validSherlock); got != validSherlock {
+		t.Fatalf("未提取有效的 sherlockToken: %s", got)
+	}
+	if got := cookieARPSession("ims_sid=s1; sherlockToken=" + flaggedSherlock); got != "" {
+		t.Fatalf("不应采用触发风控 rid=100 的 sherlockToken: %s", got)
+	}
+}
+

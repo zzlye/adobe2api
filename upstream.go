@@ -973,6 +973,9 @@ func (g *AdobeGenerator) refreshIMS(ctx context.Context, account Account) (Accou
 		return account, errAdobeAccountMismatch
 	}
 	account.Cookie = mergeAdobeCookies(account.Cookie, response.Cookies())
+	if account.ARPSession == "" {
+		account.ARPSession = cookieARPSession(account.Cookie)
+	}
 	account.AccessToken, account.UserID = token, refreshedUserID
 	if payload.RefreshToken != "" {
 		account.RefreshToken = payload.RefreshToken
@@ -1020,3 +1023,37 @@ func mergeAdobeCookies(raw string, incoming []*http.Cookie) string {
 	}
 	return strings.Join(pairs, "; ")
 }
+
+// cookieARPSession 从导入的浏览器 Cookie 中提取已通过校验的 sherlockToken 风险会话，避免无头浏览器二次刷新触发 Arkose 风控（rid=100）。
+func cookieARPSession(raw string) string {
+	request := &http.Request{Header: http.Header{"Cookie": []string{raw}}}
+	cookie, err := request.Cookie("sherlockToken")
+	if err != nil || strings.TrimSpace(cookie.Value) == "" {
+		return ""
+	}
+	value := strings.TrimSpace(cookie.Value)
+	decoded, err := base64.StdEncoding.DecodeString(strings.NewReplacer("-", "+", "_", "/").Replace(value))
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(strings.NewReplacer("-", "+", "_", "/").Replace(strings.TrimRight(value, "=")))
+		if err != nil {
+			return ""
+		}
+	}
+	var payload struct {
+		SID string `json:"sid"`
+		FTR string `json:"ftr"`
+		ARK string `json:"ark"`
+		BFP string `json:"bfp"`
+	}
+	if json.Unmarshal(decoded, &payload) != nil {
+		return ""
+	}
+	if strings.TrimSpace(payload.SID) == "" || strings.TrimSpace(payload.ARK) == "" || strings.Contains(payload.ARK, "rid=100") {
+		return ""
+	}
+	if strings.TrimSpace(payload.FTR) == "" && strings.TrimSpace(payload.BFP) == "" {
+		return ""
+	}
+	return value
+}
+
