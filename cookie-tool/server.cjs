@@ -1,6 +1,7 @@
 // Adobe 账号自动登录与 Cookie（含风险会话 sherlockToken）可视化提取工具
 // 双击「启动Cookie提取工具.bat」自动打开 GUI 界面（http://127.0.0.1:18899）
 
+const crypto = require('crypto');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -119,6 +120,9 @@ async function extractAdobeCookie(params) {
   log('正在读取邮箱初始状态并启动独立浏览器...');
   const beforeMail = await fetchLatestOutlookCode(mailClientId, mailRefreshToken);
 
+  const loginUrl =
+    'https://ims-na1.adobelogin.com/ims/authorize/v2?client_id=clio-playground-web&scope=AdobeID%2Cfirefly_api%2Copenid%2Cpps.read%2Cpps.write%2Cadditional_info.projectedProductContext%2Cadditional_info.ownerOrg%2Cuds_read%2Cuds_write%2Cab.manage%2Cread_organizations%2Cadditional_info.roles%2Caccount_cluster.read%2Ccreative_production%2Ctk_platform%2Ctk_platform_sync%2Caf_byof%2Cprofile%2Cdii_lr_ml_unlimited&redirect_uri=https%3A%2F%2Ffirefly.adobe.com%2Fgenerate%2Fimage&response_type=token&state=%7B%22ac%22%3A%22firefly.adobe.com%22%7D&locale=en_US';
+
   const child = spawn(
     browserPath,
     [
@@ -126,7 +130,7 @@ async function extractAdobeCookie(params) {
       `--user-data-dir=${profileDir}`,
       '--no-first-run',
       '--no-default-browser-check',
-      'https://account.adobe.com/'
+      loginUrl
     ],
     { detached: false, stdio: 'ignore' }
   );
@@ -184,7 +188,7 @@ async function extractAdobeCookie(params) {
         ws.send(JSON.stringify({ id, method, params: cmdParams }));
       });
 
-    log(`正在等待 Adobe 登录框并输入邮箱 ${email}...`);
+    log(`正在打开 Adobe 登录框并输入邮箱 ${email}...`);
     for (let i = 0; i < 30; i++) {
       await new Promise(r => setTimeout(r, 1000));
       const check = await send('Runtime.evaluate', {
@@ -194,6 +198,7 @@ async function extractAdobeCookie(params) {
       if (check.result?.value) break;
     }
 
+    await new Promise(r => setTimeout(r, 2000));
     await send('Runtime.evaluate', {
       expression: `(() => {
         const el = document.querySelector('#EmailPage-EmailField');
@@ -206,7 +211,7 @@ async function extractAdobeCookie(params) {
       })()`
     });
     await send('Input.insertText', { text: email });
-    await new Promise(r => setTimeout(r, 600));
+    await new Promise(r => setTimeout(r, 1000));
     await send('Runtime.evaluate', {
       expression: `document.querySelector('[data-id=EmailPage-ContinueButton]')?.click()`
     });
@@ -214,24 +219,26 @@ async function extractAdobeCookie(params) {
     await new Promise(r => setTimeout(r, 7000));
 
     // 如果提供了微软邮箱令牌且未填密码（或优先使用一次性验证码），自动点一次性验证码登录
-    let loggedIn = false;
-    for (let step = 0; step < 35; step++) {
+    let submittedAuth = false;
+    for (let step = 0; step < 45; step++) {
       await new Promise(r => setTimeout(r, 1500));
       const stateRes = await send('Runtime.evaluate', {
         expression: `JSON.stringify({
           url: location.href,
+          text: document.body ? document.body.innerText.slice(0, 300) : '',
           hasPwd: Boolean(document.querySelector('#PasswordPage-PasswordField')),
-          hasOtpBtn: Array.from(document.querySelectorAll('button, a')).some(b => /one-time code|sign in with a code|验证码/i.test(b.innerText)),
+          hasUsePwdBtn: Array.from(document.querySelectorAll('button, a')).some(b => /sign in with your password|continue with password|use password|密码/i.test(b.innerText || b.textContent || '')),
+          hasOtpBtn: Array.from(document.querySelectorAll('button, a')).some(b => /one-time code|sign in with a code|send.*verification code|验证码/i.test(b.innerText || b.textContent || '')),
           hasCodeBoxes: document.querySelectorAll('[data-id^=CodeInput-], input[inputmode=numeric]').length > 0,
-          hasSkipPhone: location.hash.includes('add-security-phone-number') || Boolean(document.querySelector('[data-id=PP-AddSecurityPhoneNumber-skip-btn]')),
-          isAccountHome: location.hostname === 'account.adobe.com'
+          hasSkipPhone: location.hash.includes('add-security-phone-number') || Boolean(document.querySelector('[data-id=PP-AddSecurityPhoneNumber-skip-btn]')) || /mobile phone number|Not now/i.test(document.body ? document.body.innerText : ''),
+          isAccountHome: location.hostname === 'firefly.adobe.com'
         })`,
         returnByValue: true
       });
       const st = JSON.parse(stateRes.result.value);
+      if (step < 5) console.log('Step', step, st.url.slice(0, 70), 'hasPwd:', st.hasPwd, 'hasOtpBtn:', st.hasOtpBtn, 'text:', st.text.replace(/\s+/g, ' ').slice(0, 120));
 
-      if (st.isAccountHome) {
-        loggedIn = true;
+      if (submittedAuth && st.isAccountHome) {
         break;
       }
 
@@ -240,10 +247,23 @@ async function extractAdobeCookie(params) {
         await send('Runtime.evaluate', {
           expression: `(() => {
             const btn = document.querySelector('[data-id=PP-AddSecurityPhoneNumber-skip-btn]') ||
-              Array.from(document.querySelectorAll('button')).find(b => /not now|skip|以后|跳过/i.test(b.innerText));
+              Array.from(document.querySelectorAll('button, a')).find(b => /not now|skip|以后|跳过/i.test(b.innerText || b.textContent || ''));
             if (btn) btn.click();
           })()`
         });
+        await new Promise(r => setTimeout(r, 4000));
+        continue;
+      }
+
+      if (!st.hasPwd && st.hasUsePwdBtn && adobePassword) {
+        log('正在切换至密码登录...');
+        await send('Runtime.evaluate', {
+          expression: `(() => {
+            const btn = Array.from(document.querySelectorAll('button, a')).find(b => /sign in with your password|continue with password|use password|密码/i.test(b.innerText || b.textContent || ''));
+            if (btn) btn.click();
+          })()`
+        });
+        await new Promise(r => setTimeout(r, 2500));
         continue;
       }
 
@@ -267,6 +287,7 @@ async function extractAdobeCookie(params) {
         await send('Runtime.evaluate', {
           expression: `document.querySelector('[data-id=PasswordPage-ContinueButton]')?.click()`
         });
+        submittedAuth = true;
         await new Promise(r => setTimeout(r, 5000));
         continue;
       }
@@ -313,16 +334,27 @@ async function extractAdobeCookie(params) {
         await send('Runtime.evaluate', {
           expression: `document.querySelector('button[type=submit], [data-id*=Continue]')?.click()`
         });
+        submittedAuth = true;
         await new Promise(res => setTimeout(res, 5000));
       }
     }
 
     log('登录成功！正在进入 Firefly 生图页采集风险会话（约 25 秒）...');
-    await send('Page.navigate', { url: 'https://firefly.adobe.com/generate/image' });
+    const hostCheck = await send('Runtime.evaluate', {
+      expression: `location.hostname`,
+      returnByValue: true
+    });
+    if (hostCheck.result?.value !== 'firefly.adobe.com') {
+      await send('Page.navigate', { url: 'https://firefly.adobe.com/generate/image' });
+    }
     for (let i = 0; i < 30; i++) {
       await new Promise(r => setTimeout(r, 2000));
       const check = await send('Runtime.evaluate', {
-        expression: `JSON.stringify({ url: location.href, hasEl: Boolean(document.querySelector('firefly-image-generation')) })`,
+        expression: `(() => {
+          const acceptBtn = document.querySelector('#onetrust-accept-btn-handler');
+          if (acceptBtn) acceptBtn.click();
+          return JSON.stringify({ url: location.href, hasEl: Boolean(document.querySelector('firefly-image-generation')) });
+        })()`,
         returnByValue: true
       });
       const st = JSON.parse(check.result.value);
@@ -352,11 +384,15 @@ async function extractAdobeCookie(params) {
           let d;
           d = s(v => { if (typeof d === 'function') d(); resolve(v); });
         });
-        for (let i = 0; i < 12; i++) {
+        for (let i = 0; i < 15; i++) {
+          const acceptBtn = document.querySelector('#onetrust-accept-btn-handler');
+          if (acceptBtn) acceptBtn.click();
           const [token, arp, profile] = await Promise.all([read(auth.accessToken), read(auth.arpSessionToken), read(auth.userProfile)]);
           try {
-            const decoded = JSON.parse(atob(arp));
-            if (decoded.ftr) return JSON.stringify({ token, arp, profile });
+            if (arp) {
+              const decoded = JSON.parse(atob(arp));
+              if (decoded && decoded.ftr && !decoded.ftr.includes('___') && profile && profile.userId) return JSON.stringify({ token, arp, profile });
+            }
           } catch {}
           await new Promise(r => setTimeout(r, 2000));
         }
