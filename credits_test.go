@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func creditSnapshot(t *testing.T, total, used, available float64, period string) *adobeCreditBalance {
@@ -203,3 +204,59 @@ func TestAdobeRefreshReadsBalanceWithoutRepeatingBrowser(t *testing.T) {
 		})
 	}
 }
+
+func TestAccountPlanInferenceAndSchedulingStrategy(t *testing.T) {
+	if inferAccountPlan(50000, "HARD") != "premium" || inferAccountPlan(10000, "HARD") != "pro_plus" || inferAccountPlan(4000, "HARD") != "pro" || inferAccountPlan(2000, "HARD") != "standard" || inferAccountPlan(10, "FREE") != "free" {
+		t.Fatal("会员等级推断结果不符合预期")
+	}
+	store := newStorageTestStore(t)
+	settings := store.Settings()
+	settings.MaxConcurrent = 10
+	settings.AccountStrategy = "prefer_pro_plus_low_res"
+	settings.CreditUsage = "free_only"
+	if err := store.SaveSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	premiumAcc := Account{ID: "acc-premium", Name: "Premium号", Enabled: true, Status: "ready", Credits: floatPointer(48935), CreditsTotal: floatPointer(50000), Plan: "premium", RequestsPerMinute: 1}
+	proPlusAcc := Account{ID: "acc-pro-plus", Name: "ProPlus号", Enabled: true, Status: "ready", Credits: floatPointer(9500), CreditsTotal: floatPointer(10000), Plan: "pro_plus", RequestsPerMinute: 1}
+	if err := store.SaveAccount(premiumAcc); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAccount(proPlusAcc); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{store: store, busy: make(map[string]bool)}
+
+	// 1K/2K 请求优先分配给 Pro Plus 账号；当 Pro Plus 达到每分钟限制时回退到同样免积分的 Premium 账号。
+	acc1, rel1, err := app.reserveAccountForInput(GenerateInput{Model: "gpt-image-2.5-sunburst", Resolution: "2K"})
+	if err != nil || acc1.ID != "acc-pro-plus" {
+		t.Fatalf("2K 请求应优先分配 Pro Plus，实际: %v, err=%v", acc1.ID, err)
+	}
+	rel1()
+	acc2, rel2, err := app.reserveAccountForInput(GenerateInput{Model: "gpt-image-2.5-sunburst", Resolution: "2K"})
+	if err != nil || acc2.ID != "acc-premium" {
+		t.Fatalf("Pro Plus 限流后 2K 请求应回退到 Premium，实际: %v, err=%v", acc2.ID, err)
+	}
+	rel2()
+
+	// 不用积分模式下，4K 请求在 Premium 限流时绝不调度需要扣积分的 Pro Plus 账号。
+	if _, _, err := app.reserveAccountForInput(GenerateInput{Model: "gpt-image-2.5-sunburst", Resolution: "4K"}); !errors.Is(err, errRateLimited) {
+		t.Fatalf("不用积分模式下 4K 请求在 Premium 限流时应返回 429 限流，实际: %v", err)
+	}
+
+	// 切换为可用积分模式后，4K 请求在 Premium 限流时可回退至有余额的 Pro Plus 账号（重置 Pro Plus 频率计数验证）。
+	app.requestHistory = make(map[string][]time.Time)
+	acc4k1, rel4k1, err := app.reserveAccountForInput(GenerateInput{Model: "gpt-image-2.5-sunburst", Resolution: "4K"})
+	if err != nil || acc4k1.ID != "acc-premium" {
+		t.Fatalf("4K 请求应优先分配 Premium，实际: %v, err=%v", acc4k1.ID, err)
+	}
+	rel4k1()
+	settings.CreditUsage = "allow_credits"
+	_ = store.SaveSettings(settings)
+	acc4k2, rel4k2, err := app.reserveAccountForInput(GenerateInput{Model: "gpt-image-2.5-sunburst", Resolution: "4K"})
+	if err != nil || acc4k2.ID != "acc-pro-plus" {
+		t.Fatalf("可用积分模式下 Premium 限流后 4K 请求应允许回退到 Pro Plus，实际: %v, err=%v", acc4k2.ID, err)
+	}
+	rel4k2()
+}
+

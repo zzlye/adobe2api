@@ -685,11 +685,22 @@ func (g *AdobeGenerator) Generate(ctx context.Context, account Account, input Ge
 		}
 		references = append(references, map[string]string{"id": id, "usage": "mask"})
 	}
-	// 账号池在一次生成期间独占该账号，以前后余额差记录实际消耗。
+	// 账号池在一次生成期间独占该账号，以前后余额差记录实际消耗，并同步最新会员与余额。
 	before := g.readCreditBalance(ctx, client, account, log)
+	if before != nil {
+		result.AccountCredits = before.Total.Quota.Available
+		result.AccountCreditsTotal = before.Total.Quota.Total
+		result.AccountPlan = inferAccountPlan(*before.Total.Quota.Total, before.Total.PlanCap)
+	}
 	defer func() {
 		if before != nil {
-			result.Credits = creditConsumption(before, g.readCreditBalance(ctx, client, account, log))
+			after := g.readCreditBalance(ctx, client, account, log)
+			if after != nil {
+				result.AccountCredits = after.Total.Quota.Available
+				result.AccountCreditsTotal = after.Total.Quota.Total
+				result.AccountPlan = inferAccountPlan(*after.Total.Quota.Total, after.Total.PlanCap)
+			}
+			result.Credits = creditConsumption(before, after)
 		}
 	}()
 	// 上游每次只提交一次生图；失败不重试 POST，避免重复消耗积分。
@@ -849,16 +860,18 @@ func (g *AdobeGenerator) downloadImage(ctx context.Context, client *http.Client,
 }
 
 func (g *AdobeGenerator) Refresh(ctx context.Context, account Account) (updated Account, err error) {
-	// 统一在登录状态就绪后读取余额，不额外启动浏览器或覆盖保存中的其他账号字段。
+	// 统一在登录状态就绪后读取余额与会员等级，不额外启动浏览器或覆盖保存中的其他账号字段。
 	defer func() {
 		if err != nil {
 			return
 		}
 		updated.Credits = nil
+		updated.CreditsTotal = nil
+		updated.Plan = ""
 		client, _, clientErr := g.clients()
 		if clientErr == nil {
 			if balance := g.readCreditBalance(ctx, client, updated, nil); balance != nil {
-				updated.Credits = balance.Total.Quota.Available
+				applyCreditBalance(&updated, balance)
 			}
 		}
 	}()

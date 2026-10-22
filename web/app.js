@@ -115,6 +115,20 @@ function statusBadge(value) {
   const cls = ['active', 'ready', 'healthy', 'valid', 'ok'].includes(key) ? 'success' : ['pending', 'unverified', 'cooldown', 'missing', 'missing_credentials', 'unknown'].includes(key) ? 'warning' : key;
   return el('span', { class: `badge ${['success', 'failed', 'error', 'expired', 'refreshing', 'running', 'disabled', 'warning'].includes(cls) ? cls : ''}`, text: labels[key] || key });
 }
+function planBadge(account) {
+  const key = String(account?.plan || '').toLowerCase();
+  const labels = {
+    premium: 'Firefly Premium',
+    pro_plus: 'Firefly Pro Plus',
+    pro: 'Firefly Pro',
+    standard: 'Firefly Standard',
+    free: '免费版',
+    paid: '付费版'
+  };
+  if (!labels[key]) return el('span', { class: 'badge disabled', text: '待识别' });
+  const cls = key === 'premium' ? 'plan-premium' : key === 'pro_plus' ? 'plan-pro-plus' : key === 'pro' ? 'plan-pro' : key === 'free' ? 'warning' : 'success';
+  return el('span', { class: `badge ${cls}`, text: labels[key] });
+}
 function errorMessage(error) { return error instanceof Error ? error.message : String(error || '操作失败'); }
 function toast(message, isError = false) {
   const item = el('div', { class: `toast${isError ? ' error' : ''}` }, icon(isError ? 'alert' : 'check-circle'), el('span', { text: message }));
@@ -419,7 +433,10 @@ function renderAccounts() {
       onmouseleave: () => hideAccountStatsPopover()
     });
     const refresh = el('button', { class: 'icon-button', title: '刷新登录', 'aria-label': '刷新登录', onclick: () => refreshAccount(account, refresh) }, icon('refresh'));
-    return el('tr', {}, el('td', {}, el('div', { class: 'account-identity' }, el('span', { class: 'avatar', text: (account.name || account.email || 'A').slice(0, 1).toUpperCase() }), el('div', {}, el('div', { class: 'account-name', text: account.name || '未命名账号' }), el('div', { class: 'account-email', text: account.email || '—' })))), el('td', { title: account.last_error || '' }, statusBadge(account.enabled ? account.status : 'disabled')), el('td', { text: count(account.credits, 2) }), el('td', {}, genTrigger), el('td', {}, rpmField), el('td', { text: date(account.last_refresh, true) }), el('td', {}, toggle), el('td', {}, el('div', { class: 'table-actions' }, refresh, el('button', { class: 'icon-button', title: '编辑账号', 'aria-label': '编辑账号', onclick: () => openAccount(account) }, icon('edit')), el('button', { class: 'icon-button danger', title: '删除账号', 'aria-label': '删除账号', onclick: () => deleteAccount(account) }, icon('trash')))));
+    const creditsText = account.credits_total != null && account.credits != null
+      ? `${count(account.credits, 0)} / ${count(account.credits_total, 0)}`
+      : count(account.credits, 2);
+    return el('tr', {}, el('td', {}, el('div', { class: 'account-identity' }, el('span', { class: 'avatar', text: (account.name || account.email || 'A').slice(0, 1).toUpperCase() }), el('div', {}, el('div', { class: 'account-name', text: account.name || '未命名账号' }), el('div', { class: 'account-email', text: account.email || '—' })))), el('td', {}, planBadge(account)), el('td', { title: account.last_error || '' }, statusBadge(account.enabled ? account.status : 'disabled')), el('td', { text: creditsText }), el('td', {}, genTrigger), el('td', {}, rpmField), el('td', { text: date(account.last_refresh, true) }), el('td', {}, toggle), el('td', {}, el('div', { class: 'table-actions' }, refresh, el('button', { class: 'icon-button', title: '编辑账号', 'aria-label': '编辑账号', onclick: () => openAccount(account) }, icon('edit')), el('button', { class: 'icon-button danger', title: '删除账号', 'aria-label': '删除账号', onclick: () => deleteAccount(account) }, icon('trash')))));
   }));
 }
 async function refreshAccount(account, button) {
@@ -586,7 +603,11 @@ async function loadSettings(displayError = true) {
     state.settings = data;
     state.settingsDirty = false;
     const form = $('#settings-form');
-    for (const field of ['public_url', 'proxy_url', 'admin_username', 'account_strategy', 'refresh_minutes', 'retention_hours', 'max_storage_mb', 'max_concurrent', 'request_timeout_seconds', 'log_retention_days']) form.elements[field].value = data[field] ?? (field === 'account_strategy' ? 'round_robin' : '');
+    for (const field of ['public_url', 'proxy_url', 'admin_username', 'account_strategy', 'credit_usage', 'refresh_minutes', 'retention_hours', 'max_storage_mb', 'max_concurrent', 'request_timeout_seconds', 'log_retention_days']) {
+      if (field === 'account_strategy') form.elements[field].value = data[field] || 'round_robin';
+      else if (field === 'credit_usage') form.elements[field].value = data[field] || 'allow_credits';
+      else form.elements[field].value = data[field] ?? '';
+    }
     form.elements.password.value = '';
     $('#api-key-list').replaceChildren();
     (data.api_keys || []).forEach(key => addKey(key));
@@ -756,6 +777,9 @@ $('#account-form').addEventListener('submit', async event => {
     $('#account-dialog').close();
     toast(browserMode ? result.created ? '账号已导入' : '账号登录已更新' : editing ? '账号已保存' : '账号已导入');
     await loadAccounts();
+    if (!editing && !browserMode && result?.id) {
+      api(`/api/admin/accounts/${encodeURIComponent(result.id)}/refresh`, { method: 'POST' }).then(() => loadAccounts()).catch(() => {});
+    }
   } catch (error) { $('#account-form-error').textContent = errorMessage(error); $('#account-form-error').hidden = false; }
   finally {
     state.accountSubmitting = false;
@@ -772,7 +796,7 @@ $('#settings-form').addEventListener('submit', async event => {
   event.preventDefault();
   const form = event.currentTarget;
   const body = {};
-  for (const key of ['public_url', 'proxy_url', 'admin_username', 'account_strategy']) body[key] = form.elements[key].value.trim();
+  for (const key of ['public_url', 'proxy_url', 'admin_username', 'account_strategy', 'credit_usage']) body[key] = form.elements[key].value.trim();
   for (const key of ['refresh_minutes', 'retention_hours', 'max_storage_mb', 'max_concurrent', 'request_timeout_seconds', 'log_retention_days']) body[key] = Number(form.elements[key].value);
   body.api_keys = [...new Set($$('#api-key-list input').map(input => input.value.trim()).filter(Boolean))];
   if (form.elements.password.value) body.password = form.elements.password.value;

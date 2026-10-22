@@ -106,3 +106,74 @@ func (g *AdobeGenerator) fetchCreditBalance(ctx context.Context, client *http.Cl
 	}
 	return &balance, nil
 }
+
+// inferAccountPlan 根据积分总额度与配额上限类型推断账号的 Firefly 会员等级。
+func inferAccountPlan(total float64, planCap string) string {
+	switch {
+	case total >= 45000:
+		return "premium"
+	case total >= 9000:
+		return "pro_plus"
+	case total >= 3500:
+		return "pro"
+	case total >= 1500:
+		return "standard"
+	case planCap == "FREE" || total <= 100:
+		return "free"
+	default:
+		return "paid"
+	}
+}
+
+// applyCreditBalance 将上游返回的可用积分、总额度与会员等级写入账号。
+func applyCreditBalance(account *Account, balance *adobeCreditBalance) {
+	if account == nil || balance == nil || !validCreditQuota(balance.Total.Quota) {
+		return
+	}
+	available := *balance.Total.Quota.Available
+	total := *balance.Total.Quota.Total
+	account.Credits = &available
+	account.CreditsTotal = &total
+	account.Plan = inferAccountPlan(total, balance.Total.PlanCap)
+}
+
+// effectiveAccountPlan 返回账号当前识别出的会员等级，兼容旧数据按总额或可用余额推断。
+func effectiveAccountPlan(account Account) string {
+	if account.Plan != "" {
+		return account.Plan
+	}
+	if account.CreditsTotal != nil {
+		return inferAccountPlan(*account.CreditsTotal, "")
+	}
+	if account.Credits != nil {
+		switch {
+		case *account.Credits >= 45000:
+			return "premium"
+		case *account.Credits >= 9000:
+			return "pro_plus"
+		case *account.Credits >= 3500:
+			return "pro"
+		case *account.Credits >= 1500:
+			return "standard"
+		}
+	}
+	return ""
+}
+
+// accountCoversFreeGeneration 判断账号会员等级在当前请求分辨率与模型下是否支持免积分无限生图。
+func accountCoversFreeGeneration(account Account, input GenerateInput) bool {
+	switch effectiveAccountPlan(account) {
+	case "premium":
+		return true
+	case "pro_plus":
+		return input.Resolution != "4K"
+	case "pro":
+		return (input.Resolution == "" || input.Resolution == "512" || input.Resolution == "1K") && (input.Model == "" || input.Model == "gemini-3.1-flash-image-preview")
+	case "standard", "free", "paid":
+		return false
+	default:
+		// 尚未完成首次积分与会员查询的账号允许参与首次刷新校验。
+		return account.Credits == nil && account.CreditsTotal == nil
+	}
+}
+

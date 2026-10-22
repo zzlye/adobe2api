@@ -178,7 +178,49 @@ func (a *App) accountAvailableLocked(account Account, now time.Time) bool {
 	return !a.busy[account.ID] && inFlight == 0
 }
 
+// accountEligibleByCreditUsage 根据积分消耗策略判断账号是否允许参与当前规格生图。
+func accountEligibleByCreditUsage(account Account, input GenerateInput, creditUsage string) bool {
+	if !account.Enabled {
+		return false
+	}
+	if creditUsage == "free_only" {
+		return accountCoversFreeGeneration(account, input)
+	}
+	if !accountCoversFreeGeneration(account, input) && account.Credits != nil && *account.Credits <= 0 {
+		return false
+	}
+	return true
+}
+
+// accountPriorityTier 在“1K/2K 优先 Pro Plus”策略下划分账号优先级（0 最高，1 次优，2 兜底）。
+func accountPriorityTier(account Account, input GenerateInput) int {
+	plan := effectiveAccountPlan(account)
+	if input.Resolution == "4K" {
+		if plan == "premium" {
+			return 0
+		}
+		return 1
+	}
+	switch plan {
+	case "pro_plus":
+		return 0
+	case "pro":
+		if (input.Resolution == "" || input.Resolution == "512" || input.Resolution == "1K") && (input.Model == "" || input.Model == "gemini-3.1-flash-image-preview") {
+			return 0
+		}
+		return 2
+	case "premium":
+		return 1
+	default:
+		return 2
+	}
+}
+
 func (a *App) reserveAccount() (Account, func(), error) {
+	return a.reserveAccountForInput(GenerateInput{})
+}
+
+func (a *App) reserveAccountForInput(input GenerateInput) (Account, func(), error) {
 	a.poolMu.Lock()
 	defer a.poolMu.Unlock()
 	accounts, err := a.store.Accounts()
@@ -195,7 +237,21 @@ func (a *App) reserveAccount() (Account, func(), error) {
 	if !hasEnabled {
 		return Account{}, nil, errors.New("暂无可用账号，请检查账号池")
 	}
-	if a.active >= a.store.Settings().MaxConcurrent {
+	settings := a.store.Settings()
+	hasEligible := false
+	for _, account := range accounts {
+		if accountEligibleByCreditUsage(account, input, settings.CreditUsage) {
+			hasEligible = true
+			break
+		}
+	}
+	if !hasEligible {
+		if settings.CreditUsage == "free_only" {
+			return Account{}, nil, errors.New("当前为不用积分模式，暂无支持该规格免积分生图的会员账号")
+		}
+		return Account{}, nil, errors.New("暂无可用积分的账号，请检查账号池")
+	}
+	if a.active >= settings.MaxConcurrent {
 		return Account{}, nil, errRateLimited
 	}
 	if a.busy == nil {
@@ -208,24 +264,8 @@ func (a *App) reserveAccount() (Account, func(), error) {
 		a.requestHistory = make(map[string][]time.Time)
 	}
 	now := time.Now()
-	// 先从全部可接收请求的启用账号中均匀抽样，不能随机起点后顺延造成权重偏差。
-	if a.store.Settings().AccountStrategy == "random" {
-		candidates := make([]int, 0, len(accounts))
-		for i, account := range accounts {
-			if a.accountAvailableLocked(account, now) {
-				candidates = append(candidates, i)
-			}
-		}
-		if len(candidates) > 0 {
-			a.next = candidates[rand.IntN(len(candidates))]
-		}
-	}
-	for i := 0; i < len(accounts); i++ {
-		index := (a.next + i) % len(accounts)
+	commitIndex := func(index int) (Account, func(), error) {
 		account := accounts[index]
-		if !a.accountAvailableLocked(account, now) {
-			continue
-		}
 		a.next = index + 1
 		a.active++
 		a.activeByAccount[account.ID]++
@@ -243,6 +283,40 @@ func (a *App) reserveAccount() (Account, func(), error) {
 			a.active--
 			a.poolMu.Unlock()
 		}, nil
+	}
+	if settings.AccountStrategy == "prefer_pro_plus_low_res" {
+		for tier := 0; tier <= 2; tier++ {
+			for i := 0; i < len(accounts); i++ {
+				index := (a.next + i) % len(accounts)
+				account := accounts[index]
+				if !accountEligibleByCreditUsage(account, input, settings.CreditUsage) || accountPriorityTier(account, input) != tier || !a.accountAvailableLocked(account, now) {
+					continue
+				}
+				return commitIndex(index)
+			}
+		}
+		return Account{}, nil, errRateLimited
+	}
+	// 先从全部可接收请求的启用账号中均匀抽样，不能随机起点后顺延造成权重偏差。
+	if settings.AccountStrategy == "random" {
+		candidates := make([]int, 0, len(accounts))
+		for i, account := range accounts {
+			if accountEligibleByCreditUsage(account, input, settings.CreditUsage) && a.accountAvailableLocked(account, now) {
+				candidates = append(candidates, i)
+			}
+		}
+		if len(candidates) > 0 {
+			return commitIndex(candidates[rand.IntN(len(candidates))])
+		}
+		return Account{}, nil, errRateLimited
+	}
+	for i := 0; i < len(accounts); i++ {
+		index := (a.next + i) % len(accounts)
+		account := accounts[index]
+		if !accountEligibleByCreditUsage(account, input, settings.CreditUsage) || !a.accountAvailableLocked(account, now) {
+			continue
+		}
+		return commitIndex(index)
 	}
 	return Account{}, nil, errRateLimited
 }
@@ -282,7 +356,7 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 	}
 	entry.Model = input.Model
 	entry.Parameters = input.parameterJSON()
-	account, release, err := a.reserveAccount()
+	account, release, err := a.reserveAccountForInput(input)
 	if err != nil {
 		if errors.Is(err, errRateLimited) {
 			entry.HTTPStatus = http.StatusTooManyRequests
@@ -319,8 +393,21 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 		if err := saveAccountState(account); err != nil {
 			return finish(GenerateResult{}, err)
 		}
+		if !accountEligibleByCreditUsage(account, input, a.store.Settings().CreditUsage) {
+			entry.HTTPStatus = http.StatusServiceUnavailable
+			return finish(GenerateResult{}, errors.New("当前为不用积分模式，暂无支持该规格免积分生图的会员账号"))
+		}
 	}
 	result, err := a.generator.Generate(ctx, account, input, &entry)
+	if result.AccountCredits != nil {
+		account.Credits = result.AccountCredits
+	}
+	if result.AccountCreditsTotal != nil {
+		account.CreditsTotal = result.AccountCreditsTotal
+	}
+	if result.AccountPlan != "" {
+		account.Plan = result.AccountPlan
+	}
 	if err != nil {
 		var upstream *UpstreamError
 		if errors.As(err, &upstream) {
@@ -334,6 +421,8 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 			if upstream != nil && (upstream.StatusCode == 401 || upstream.StatusCode == 403 && upstream.AccessError != "user_not_entitled") {
 				account.Status = "expired"
 			}
+			_ = saveAccountState(account)
+		} else if result.AccountCredits != nil {
 			_ = saveAccountState(account)
 		}
 	} else {

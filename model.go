@@ -18,6 +18,7 @@ type Settings struct {
 	MaxStorageMB          int64    `json:"max_storage_mb"`
 	MaxConcurrent         int      `json:"max_concurrent"`
 	AccountStrategy       string   `json:"account_strategy"`
+	CreditUsage           string   `json:"credit_usage"`
 	RequestTimeoutSeconds int      `json:"request_timeout_seconds"`
 	LogRetentionDays      int      `json:"log_retention_days"`
 }
@@ -38,9 +39,11 @@ type Account struct {
 	Nonce          string    `json:"nonce,omitempty"`
 	ExpiresAt      time.Time `json:"expires_at"`
 	LastRefresh    time.Time `json:"last_refresh"`
-	Status         string    `json:"status"`
-	LastError      string    `json:"last_error"`
+	Status            string    `json:"status"`
+	LastError         string    `json:"last_error"`
 	Credits           *float64  `json:"credits"`
+	CreditsTotal      *float64  `json:"credits_total,omitempty"`
+	Plan              string    `json:"plan,omitempty"`
 	RequestsPerMinute int       `json:"requests_per_minute"`
 	BrowserProfile    string    `json:"browser_profile,omitempty"`
 }
@@ -148,8 +151,11 @@ type AdobeOutput struct {
 }
 
 type GenerateResult struct {
-	Images  []ImageRecord
-	Credits *float64
+	Images              []ImageRecord
+	Credits             *float64
+	AccountCredits      *float64
+	AccountCreditsTotal *float64
+	AccountPlan         string
 }
 
 // Generator 将协议转换和上游生成分开，便于验证协议与真实请求行为。

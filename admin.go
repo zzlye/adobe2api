@@ -342,6 +342,9 @@ type adminAccount struct {
 
 func publicAdminAccount(account Account) adminAccount {
 	hasCredentials := account.Cookie != "" || account.AccessToken != "" || account.RefreshToken != ""
+	if account.Plan == "" {
+		account.Plan = effectiveAccountPlan(account)
+	}
 	account.Cookie, account.AccessToken, account.RefreshToken = "", "", ""
 	account.ClientID, account.APIKey, account.ARPSession, account.Nonce, account.BrowserProfile = "", "", "", "", ""
 	account.UserID = ""
@@ -480,7 +483,7 @@ func (a *App) adminUpdateAccount(w http.ResponseWriter, r *http.Request) {
 					account.ARPSession = arp
 				}
 				account.ExpiresAt, account.LastRefresh = time.Time{}, time.Time{}
-				account.Credits, account.LastError, account.Status = nil, "", "pending"
+				account.Credits, account.CreditsTotal, account.Plan, account.LastError, account.Status = nil, nil, "", "", "pending"
 			}
 		}
 	}
@@ -897,8 +900,11 @@ func (a *App) adminGetSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func validateAdminSettings(settings Settings) error {
-	if settings.AccountStrategy != "" && settings.AccountStrategy != "round_robin" && settings.AccountStrategy != "random" {
-		return errors.New("账号分配方式应为轮询或随机")
+	if settings.AccountStrategy != "" && settings.AccountStrategy != "round_robin" && settings.AccountStrategy != "prefer_pro_plus_low_res" && settings.AccountStrategy != "random" {
+		return errors.New("账号分配方式无效")
+	}
+	if settings.CreditUsage != "" && settings.CreditUsage != "allow_credits" && settings.CreditUsage != "free_only" {
+		return errors.New("积分消耗策略应为可用积分或不用积分")
 	}
 	if settings.PublicURL != "" {
 		u, err := url.Parse(settings.PublicURL)
