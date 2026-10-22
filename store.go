@@ -690,6 +690,82 @@ func (s *Store) Stats() (map[string]any, error) {
 	return map[string]any{"total_requests": total, "success_requests": success, "failed_requests": failed, "today_requests": today, "accounts": accounts, "enabled_accounts": enabled, "storage_bytes": bytes, "image_count": images, "credits_used": creditsUsed}, nil
 }
 
+// AccountModelStat 统计单个账号在指定模型下的成功次数、生成张数与消耗积分。
+type AccountModelStat struct {
+	Model   string  `json:"model"`
+	Count   int     `json:"count"`
+	Images  int     `json:"images"`
+	Credits float64 `json:"credits"`
+}
+
+// AccountGenerationStat 汇总单个账号的累计生成张数、成功次数、消耗积分与分模型明细。
+type AccountGenerationStat struct {
+	GeneratedImages   int                `json:"generated_images"`
+	GeneratedRequests int                `json:"generated_requests"`
+	CreditsUsed       float64            `json:"credits_used"`
+	Models            []AccountModelStat `json:"models"`
+}
+
+// AccountGenerationStats 按账号汇总已完成请求的生图张数、积分消耗及分模型使用次数。
+func (s *Store) AccountGenerationStats() (map[string]AccountGenerationStat, map[string]AccountGenerationStat, error) {
+	rows, err := s.db.Query(`
+		SELECT
+			COALESCE(json_extract(CAST(payload AS TEXT), '$.account_id'), ''),
+			COALESCE(account_name, ''),
+			COALESCE(model, ''),
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN json_valid(CAST(payload AS TEXT)) AND json_type(CAST(payload AS TEXT), '$.images') = 'array' AND json_array_length(CAST(payload AS TEXT), '$.images') > 0 THEN json_array_length(CAST(payload AS TEXT), '$.images') ELSE 1 END), 0),
+			COALESCE(SUM(credits), 0)
+		FROM logs
+		WHERE status = 'success'
+		GROUP BY 1, 2, 3
+		ORDER BY 5 DESC, 4 DESC, 3 ASC
+	`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	byID := make(map[string]AccountGenerationStat)
+	byName := make(map[string]AccountGenerationStat)
+	addStat := func(target map[string]AccountGenerationStat, key, model string, count, images int, credits float64) {
+		if key == "" {
+			return
+		}
+		stat := target[key]
+		stat.GeneratedRequests += count
+		stat.GeneratedImages += images
+		stat.CreditsUsed += credits
+		merged := false
+		for i := range stat.Models {
+			if stat.Models[i].Model == model {
+				stat.Models[i].Count += count
+				stat.Models[i].Images += images
+				stat.Models[i].Credits += credits
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			stat.Models = append(stat.Models, AccountModelStat{Model: model, Count: count, Images: images, Credits: credits})
+		}
+		target[key] = stat
+	}
+	for rows.Next() {
+		var accountID, accountName, model string
+		var count, images int
+		var credits float64
+		if err := rows.Scan(&accountID, &accountName, &model, &count, &images, &credits); err != nil {
+			return nil, nil, err
+		}
+		if accountID != "" {
+			addStat(byID, accountID, model, count, images, credits)
+		} else if accountName != "" {
+			addStat(byName, accountName, model, count, images, credits)
+		}
+	}
+	return byID, byName, rows.Err()
+}
+
 func newID() string {
 	var bytes [24]byte
 	if _, err := rand.Read(bytes[:]); err != nil {

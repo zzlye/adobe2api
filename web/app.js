@@ -344,7 +344,41 @@ async function loadAccounts() {
     renderAccounts();
   } catch (error) { if (request === state.accountsRequest) showError($('#accounts-empty'), error, loadAccounts); }
 }
+function showAccountStatsPopover(anchor, account) {
+  const popover = $('#account-stats-popover');
+  if (!popover) return;
+  const models = Array.isArray(account.model_stats) ? account.model_stats : [];
+  const head = el('div', { class: 'stats-popover-head' },
+    el('span', { text: `累计生成 ${count(account.generated_images || 0)} 张` }),
+    el('span', { class: 'stats-popover-credits', text: `消耗 ${count(account.credits_used || 0, 2)} 积分` })
+  );
+  const body = models.length
+    ? el('div', { class: 'stats-popover-list' }, ...models.map(item =>
+        el('div', { class: 'stats-popover-row' },
+          el('span', { class: 'stats-popover-model', text: modelName(item.model) }),
+          el('span', { class: 'stats-popover-meta', text: `${count(item.count || 0)} 次 (${count(item.images || 0)} 张) · ${count(item.credits || 0, 2)} 积分` })
+        )
+      ))
+    : el('div', { class: 'stats-popover-empty', text: '暂无模型生成记录' });
+  popover.replaceChildren(head, body);
+  popover.hidden = false;
+  const rect = anchor.getBoundingClientRect();
+  const popRect = popover.getBoundingClientRect();
+  let top = rect.bottom + 8;
+  if (top + popRect.height > window.innerHeight - 12 && rect.top - popRect.height - 8 > 12) {
+    top = rect.top - popRect.height - 8;
+  }
+  let left = rect.left + rect.width / 2 - popRect.width / 2;
+  left = Math.max(12, Math.min(window.innerWidth - popRect.width - 12, left));
+  popover.style.top = `${Math.round(top)}px`;
+  popover.style.left = `${Math.round(left)}px`;
+}
+function hideAccountStatsPopover() {
+  const popover = $('#account-stats-popover');
+  if (popover) popover.hidden = true;
+}
 function renderAccounts() {
+  hideAccountStatsPopover();
   const query = $('#account-search').value.trim().toLowerCase();
   const items = state.accounts.filter(account => `${account.name || ''} ${account.email || ''}`.toLowerCase().includes(query));
   $('#accounts-count').textContent = `${count(state.accounts.length)} 个账号`;
@@ -377,8 +411,15 @@ function renderAccounts() {
       }
     } });
     const rpmField = el('div', { class: 'input-unit rpm-unit' }, rpmInput, el('span', { text: '次/分' }));
+    // 鼠标移入显示该账号各模型生成次数与积分消耗悬浮窗，移开立即隐藏。
+    const genTrigger = el('span', {
+      class: 'gen-count-trigger',
+      text: `${count(account.generated_images || 0)} 张`,
+      onmouseenter: event => showAccountStatsPopover(event.currentTarget, account),
+      onmouseleave: () => hideAccountStatsPopover()
+    });
     const refresh = el('button', { class: 'icon-button', title: '刷新登录', 'aria-label': '刷新登录', onclick: () => refreshAccount(account, refresh) }, icon('refresh'));
-    return el('tr', {}, el('td', {}, el('div', { class: 'account-identity' }, el('span', { class: 'avatar', text: (account.name || account.email || 'A').slice(0, 1).toUpperCase() }), el('div', {}, el('div', { class: 'account-name', text: account.name || '未命名账号' }), el('div', { class: 'account-email', text: account.email || '—' })))), el('td', { title: account.last_error || '' }, statusBadge(account.enabled ? account.status : 'disabled')), el('td', { text: count(account.credits, 2) }), el('td', {}, rpmField), el('td', { text: date(account.last_refresh, true) }), el('td', {}, toggle), el('td', {}, el('div', { class: 'table-actions' }, refresh, el('button', { class: 'icon-button', title: '编辑账号', 'aria-label': '编辑账号', onclick: () => openAccount(account) }, icon('edit')), el('button', { class: 'icon-button danger', title: '删除账号', 'aria-label': '删除账号', onclick: () => deleteAccount(account) }, icon('trash')))));
+    return el('tr', {}, el('td', {}, el('div', { class: 'account-identity' }, el('span', { class: 'avatar', text: (account.name || account.email || 'A').slice(0, 1).toUpperCase() }), el('div', {}, el('div', { class: 'account-name', text: account.name || '未命名账号' }), el('div', { class: 'account-email', text: account.email || '—' })))), el('td', { title: account.last_error || '' }, statusBadge(account.enabled ? account.status : 'disabled')), el('td', { text: count(account.credits, 2) }), el('td', {}, genTrigger), el('td', {}, rpmField), el('td', { text: date(account.last_refresh, true) }), el('td', {}, toggle), el('td', {}, el('div', { class: 'table-actions' }, refresh, el('button', { class: 'icon-button', title: '编辑账号', 'aria-label': '编辑账号', onclick: () => openAccount(account) }, icon('edit')), el('button', { class: 'icon-button danger', title: '删除账号', 'aria-label': '删除账号', onclick: () => deleteAccount(account) }, icon('trash')))));
   }));
 }
 async function refreshAccount(account, button) {

@@ -45,7 +45,7 @@
         </section>
         <section id="view-accounts" class="view" hidden>
           <div class="page-heading"><div><p class="eyebrow">ACCOUNT POOL</p><h1>账号池</h1><p class="muted">管理账号与登录状态。</p></div><button id="add-account" class="button primary"><span data-icon="plus"></span>添加账号</button></div>
-          <div class="card"><div class="list-toolbar"><div class="search-field"><span data-icon="search"></span><input id="account-search" placeholder="搜索账号" aria-label="搜索账号"></div><span id="accounts-count" class="muted small"></span></div><div class="table-scroll"><table class="data-table account-table"><thead><tr><th>账号</th><th>状态</th><th>剩余积分</th><th>每分钟请求</th><th>最近刷新</th><th>启用</th><th class="align-right">操作</th></tr></thead><tbody id="accounts-body"></tbody></table></div><div id="accounts-empty"></div></div>
+          <div class="card"><div class="list-toolbar"><div class="search-field"><span data-icon="search"></span><input id="account-search" placeholder="搜索账号" aria-label="搜索账号"></div><span id="accounts-count" class="muted small"></span></div><div class="table-scroll"><table class="data-table account-table"><thead><tr><th>账号</th><th>状态</th><th>剩余积分</th><th>已生成</th><th>每分钟请求</th><th>最近刷新</th><th>启用</th><th class="align-right">操作</th></tr></thead><tbody id="accounts-body"></tbody></table></div><div id="accounts-empty"></div></div>
         </section>
         <section id="view-logs" class="view" hidden>
           <div class="page-heading"><div><p class="eyebrow">GENERATION HISTORY</p><h1>生成记录</h1><p class="muted">回顾每一次创作与请求。</p></div></div>
@@ -63,5 +63,6 @@
   <dialog id="confirm-dialog" class="modal confirm-modal"><form method="dialog"><div class="confirm-icon" data-icon="alert"></div><h2 id="confirm-title">确认操作</h2><p id="confirm-message" class="muted"></p><div class="modal-actions"><button class="button secondary" value="cancel">取消</button><button id="confirm-submit" class="button danger" value="confirm">确认</button></div></form></dialog>
   <dialog id="image-dialog" class="image-modal"><div class="image-modal-tools"><a id="image-download" class="button secondary" download target="_blank" rel="noopener"><span data-icon="download"></span>下载图片</a><button class="icon-button" data-close-dialog="image-dialog" aria-label="关闭" data-icon="close"></button></div><img id="image-full" alt="生成图片"></dialog>
   <div id="drawer-scrim" class="drawer-scrim" hidden></div><aside id="log-drawer" class="drawer" aria-label="生成记录详情" aria-modal="true" role="dialog" hidden><div class="drawer-heading"><div><p class="eyebrow">GENERATION DETAIL</p><h2>生成详情</h2></div><button id="drawer-close" class="icon-button" aria-label="关闭详情" data-icon="close"></button></div><div id="log-detail" class="drawer-body"></div></aside>
+  <div id="account-stats-popover" class="stats-popover" role="tooltip" hidden></div>
 </body>
 </html>

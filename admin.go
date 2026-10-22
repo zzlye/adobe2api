@@ -333,7 +333,11 @@ func (a *App) authLogout(w http.ResponseWriter, r *http.Request) {
 
 type adminAccount struct {
 	Account
-	HasCredentials bool `json:"has_credentials"`
+	HasCredentials    bool               `json:"has_credentials"`
+	GeneratedImages   int                `json:"generated_images"`
+	GeneratedRequests int                `json:"generated_requests"`
+	CreditsUsed       float64            `json:"credits_used"`
+	ModelStats        []AccountModelStat `json:"model_stats"`
 }
 
 func publicAdminAccount(account Account) adminAccount {
@@ -359,9 +363,19 @@ func (a *App) adminAccounts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "读取账号失败")
 		return
 	}
+	byID, byName, _ := a.store.AccountGenerationStats()
 	items := make([]adminAccount, 0, len(accounts))
 	for _, account := range accounts {
-		items = append(items, publicAdminAccount(account))
+		item := publicAdminAccount(account)
+		stat, ok := byID[account.ID]
+		if !ok && account.Name != "" {
+			stat = byName[account.Name]
+		}
+		item.GeneratedImages = stat.GeneratedImages
+		item.GeneratedRequests = stat.GeneratedRequests
+		item.CreditsUsed = stat.CreditsUsed
+		item.ModelStats = stat.Models
+		items = append(items, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
@@ -456,9 +470,15 @@ func (a *App) adminUpdateAccount(w http.ResponseWriter, r *http.Request) {
 		if cookie != account.Cookie {
 			if sameAdobeCookieSession(account.Cookie, cookie) {
 				account.Cookie, account.Status, account.LastError = cookie, "pending", ""
+				if arp := cookieARPSession(cookie); arp != "" {
+					account.ARPSession = arp
+				}
 			} else {
 				account.Cookie, account.Email, account.UserID = cookie, email, ""
 				account.AccessToken, account.RefreshToken, account.ARPSession, account.Nonce, account.BrowserProfile = "", "", "", "", ""
+				if arp := cookieARPSession(cookie); arp != "" {
+					account.ARPSession = arp
+				}
 				account.ExpiresAt, account.LastRefresh = time.Time{}, time.Time{}
 				account.Credits, account.LastError, account.Status = nil, "", "pending"
 			}
@@ -513,6 +533,7 @@ func (a *App) adminImportAccount(w http.ResponseWriter, r *http.Request) {
 	var err error
 	if strings.TrimSpace(input.Cookie) != "" {
 		account.Cookie, account.Email, err = parseAdminCookie(input.Cookie)
+		account.ARPSession = cookieARPSession(account.Cookie)
 		account.ClientID, account.APIKey = "clio-playground-web", "clio-playground-web"
 	} else {
 		// 保留早期抓包导入兼容，新的页面只需要提供 Cookie。
@@ -548,11 +569,15 @@ func (a *App) adminImportAccount(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "账号正在使用，请稍后导入")
 			return
 		}
-		// 同账号更新必须保留经真实生成使用的风险会话，只令 Cookie 触发 IMS 续期。
+		// 同账号更新必须保留经真实生成使用的风险会话，或采用新 Cookie 携带的有效风险会话。
 		cookie := account.Cookie
+		arp := account.ARPSession
 		account = previous
 		if cookie != "" {
 			account.Cookie = cookie
+		}
+		if arp != "" {
+			account.ARPSession = arp
 		}
 		account.Status, account.LastError = "pending", ""
 		status = http.StatusOK

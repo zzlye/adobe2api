@@ -134,6 +134,10 @@ func TestAccountRequestsPerMinuteAndRateLimit429(t *testing.T) {
 	if rec := callGen(); rec.Code != 429 {
 		t.Fatalf("再次超过每分钟上限应返回 429: %d %s", rec.Code, rec.Body.String())
 	}
+	listResp := adminTestRequest(handler, "GET", "/api/admin/accounts", "", cookie, "")
+	if listResp.Code != 200 || !strings.Contains(listResp.Body.String(), `"generated_images":2`) || !strings.Contains(listResp.Body.String(), `"model":"nano-banana-2"`) {
+		t.Fatalf("账号池统计未返回生成张数与分模型统计: %d %s", listResp.Code, listResp.Body.String())
+	}
 	// 停用全部账号时返回 503。
 	adminTestRequest(handler, "PUT", "/api/admin/accounts/"+accounts[0].ID, `{"enabled":false}`, cookie, "")
 	if rec := callGen(); rec.Code != 503 {
