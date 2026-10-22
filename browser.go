@@ -81,7 +81,7 @@ const browserSessionScript = `(async () => {
  const deadline=Date.now()+60000;
  let auth;
  while(!(auth=find())){if(Date.now()>deadline)throw new Error('Adobe 生图页面未加载完成，请检查网络后重试');await new Promise(r=>setTimeout(r,500))}
- if(window.adobeIMS)await window.adobeIMS.refreshToken();
+ try{if(window.adobeIMS)await window.adobeIMS.refreshToken()}catch{}
  let token,arp,profile;
  do {
   [token,arp,profile]=await Promise.all([read(auth.accessToken),readArp(auth.arpSessionToken),read(auth.userProfile)]);
