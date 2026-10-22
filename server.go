@@ -323,17 +323,20 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 	}
 	result, err := a.generator.Generate(ctx, account, input, &entry)
 	if err != nil {
-		account.LastError = safeError(err)
-		account.Status = "error"
 		var upstream *UpstreamError
 		if errors.As(err, &upstream) {
 			entry.HTTPStatus = upstream.StatusCode
+		}
+		// 客户端取消、提示词安全拦截（451）或限流（429）不属于账号故障，不将可用账号标为异常。
+		if !errors.Is(err, context.Canceled) && (upstream == nil || (upstream.StatusCode != http.StatusTooManyRequests && upstream.StatusCode != http.StatusUnavailableForLegalReasons)) {
+			account.LastError = safeError(err)
+			account.Status = "error"
 			// 模型无权限属于账号套餐错误，不能要求有效登录重新续期。
-			if upstream.StatusCode == 401 || upstream.StatusCode == 403 && upstream.AccessError != "user_not_entitled" {
+			if upstream != nil && (upstream.StatusCode == 401 || upstream.StatusCode == 403 && upstream.AccessError != "user_not_entitled") {
 				account.Status = "expired"
 			}
+			_ = saveAccountState(account)
 		}
-		_ = saveAccountState(account)
 	} else {
 		// 只有真实生成成功才标记可用，令牌续期不代表生图能力已验证。
 		account.LastError = ""
