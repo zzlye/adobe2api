@@ -16,7 +16,7 @@ services:
       - adobe2api_data:/app/data
     shm_size: 256mb
     init: true
-    stop_grace_period: 30s
+    stop_grace_period: 95s
 
 volumes:
   adobe2api_data:

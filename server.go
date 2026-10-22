@@ -11,7 +11,6 @@ import (
 	"io/fs"
 	"log"
 	"math/rand/v2"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -454,16 +453,14 @@ func main() {
 	app.generator = generator
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	server := &http.Server{Addr: *addr, Handler: app.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 90 * time.Second, IdleTimeout: 75 * time.Second, MaxHeaderBytes: 32 << 10,
-		// 停机信号同时取消在途任务，使上游轮询可以及时终止。
-		BaseContext: func(net.Listener) context.Context { return ctx },
-	}
+	server := &http.Server{Addr: *addr, Handler: app.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 75 * time.Second, MaxHeaderBytes: 32 << 10}
 	go app.maintenance(ctx)
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		// 优雅停机等待在途生图任务完成，避免重启或更新容器时直接将进行中的请求中断为 499。
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			_ = server.Close()
