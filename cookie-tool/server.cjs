@@ -347,65 +347,58 @@ async function extractAdobeCookie(params) {
     if (hostCheck.result?.value !== 'firefly.adobe.com') {
       await send('Page.navigate', { url: 'https://firefly.adobe.com/generate/image' });
     }
+    // 清理登录页默认写入的隐私拦截 Cookie，确保 Firefly 正常加载 Forter 与 Sherlock 风险组件
+    await send('Network.deleteCookies', { name: 'OptanonConsent', domain: '.adobe.com' });
+    await send('Network.deleteCookies', { name: 'OptanonAlertBoxClosed', domain: '.adobe.com' });
+    await send('Network.deleteCookies', { name: 'kndctr_9E1005A551ED61CA0A490D45_AdobeOrg_consent', domain: '.adobe.com' });
+    await send('Page.reload');
+
+    let capturedToken = '';
+    let session = null;
     for (let i = 0; i < 30; i++) {
       await new Promise(r => setTimeout(r, 2000));
       const check = await send('Runtime.evaluate', {
         expression: `(() => {
           const acceptBtn = document.querySelector('#onetrust-accept-btn-handler');
           if (acceptBtn) acceptBtn.click();
-          return JSON.stringify({ url: location.href, hasEl: Boolean(document.querySelector('firefly-image-generation')) });
+          if (window.OneTrust && typeof window.OneTrust.AllowAll === 'function') {
+            try { window.OneTrust.AllowAll(); } catch {}
+          }
+          const imsTok = window.adobeIMS && window.adobeIMS.getAccessToken && window.adobeIMS.getAccessToken();
+          return JSON.stringify({
+            url: location.href,
+            hasEl: Boolean(document.querySelector('firefly-image-generation')),
+            token: imsTok && imsTok.token
+          });
         })()`,
         returnByValue: true
       });
-      const st = JSON.parse(check.result.value);
-      if (st.url.includes('denied.html')) {
+      const st = check.result?.value ? JSON.parse(check.result.value) : {};
+      if (st.url && st.url.includes('denied.html')) {
         throw new Error('当前网络节点不受 Adobe Firefly 支持（denied.html），请开启美国/支持地区 VPN 后重试');
       }
-      if (st.hasEl) break;
-    }
-
-    await new Promise(r => setTimeout(r, 22000));
-
-    const evalRes = await send('Runtime.evaluate', {
-      expression: `(async () => {
-        const el = document.querySelector('firefly-image-generation');
-        if (!el) return JSON.stringify({ error: '未加载出 Firefly 生图组件' });
-        const key = Object.keys(el).find(k => k.startsWith('__reactFiber'));
-        let fiber = el[key];
-        let auth;
-        for (let i = 0; fiber && i < 15; i++, fiber = fiber.return) {
-          if (fiber.memoizedProps?.service?.host?.authentication) {
-            auth = fiber.memoizedProps.service.host.authentication;
+      if (st.token) capturedToken = st.token;
+      if (st.url && st.url.includes('access_token=') && !capturedToken) {
+        const m = st.url.match(/access_token=([^&]+)/);
+        if (m) capturedToken = decodeURIComponent(m[1]);
+      }
+      const cookiesRes = await send('Network.getAllCookies');
+      const sherlock = (cookiesRes.cookies || []).find(c => c.name === 'sherlockToken')?.value;
+      if (sherlock && capturedToken) {
+        try {
+          const decoded = JSON.parse(Buffer.from(sherlock, 'base64').toString('utf8'));
+          const jwtPayload = JSON.parse(Buffer.from(capturedToken.split('.')[1], 'base64url').toString('utf8'));
+          const userId = jwtPayload.user_id || jwtPayload.sub || '';
+          session = { token: capturedToken, arp: sherlock, profile: { userId, email } };
+          if (decoded && decoded.ftr && !decoded.ftr.includes('___') && !decoded.ftr.endsWith('__tt')) {
             break;
           }
-        }
-        if (!auth) return JSON.stringify({ error: '未找到认证上下文' });
-        const read = s => new Promise(resolve => {
-          let d;
-          d = s(v => { if (typeof d === 'function') d(); resolve(v); });
-        });
-        for (let i = 0; i < 15; i++) {
-          const acceptBtn = document.querySelector('#onetrust-accept-btn-handler');
-          if (acceptBtn) acceptBtn.click();
-          const [token, arp, profile] = await Promise.all([read(auth.accessToken), read(auth.arpSessionToken), read(auth.userProfile)]);
-          try {
-            if (arp) {
-              const decoded = JSON.parse(atob(arp));
-              if (decoded && decoded.ftr && !decoded.ftr.includes('___') && profile && profile.userId) return JSON.stringify({ token, arp, profile });
-            }
-          } catch {}
-          await new Promise(r => setTimeout(r, 2000));
-        }
-        const [token, arp, profile] = await Promise.all([read(auth.accessToken), read(auth.arpSessionToken), read(auth.userProfile)]);
-        return JSON.stringify({ token, arp, profile });
-      })()`,
-      awaitPromise: true,
-      returnByValue: true
-    });
+        } catch {}
+      }
+    }
 
-    const session = JSON.parse(evalRes.result.value);
-    if (session.error || !session.token || !session.arp) {
-      throw new Error(session.error || '未能获取到完整登录令牌或风险会话');
+    if (!session || !session.token || !session.arp) {
+      throw new Error('未能获取到完整登录令牌或风险会话');
     }
 
     const cookiesRes = await send('Network.getAllCookies');
