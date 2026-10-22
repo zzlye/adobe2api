@@ -661,7 +661,7 @@ func (a *App) adminBrowserAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "浏览器同步暂不可用")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), accountRefreshTimeout)
 	defer cancel()
 	// 空账号通过刷新适配器读取当前已登录页面；这里不创建登录页，也不导航用户页面。
 	account, err := a.generator.Refresh(ctx, Account{})
@@ -839,7 +839,7 @@ func (a *App) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "账号刷新暂不可用")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), accountRefreshTimeout)
 	defer cancel()
 	updated, err := a.generator.Refresh(ctx, account)
 	if err != nil {

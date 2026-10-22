@@ -24,6 +24,9 @@ import (
 // 浏览器续期串行执行，空闲时不为每个账号保留浏览器进程。
 var browserRefreshGate = make(chan struct{}, 1)
 
+// 页面定位与会话读取各有独立等待窗口，额外预留浏览器启动和 IMS 请求时间。
+const accountRefreshTimeout = 150 * time.Second
+
 // 通过页面已有的认证服务获取会话，避免复制会随网页发布变化的模块编号。
 const browserSessionScript = `(async () => {
  const read = source => new Promise((resolve,reject) => {
@@ -111,7 +114,7 @@ func (a *App) refreshBrowser(ctx context.Context, account Account) (Account, err
 	case <-ctx.Done():
 		return account, ctx.Err()
 	}
-	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, accountRefreshTimeout)
 	defer cancel()
 	endpoint := browserEndpointForAccount(account, os.Getenv("ADOBE2API_CDP_URL"))
 	updated, err := a.refreshBrowserSession(ctx, account, endpoint)
@@ -251,7 +254,7 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 		return account, errors.New("浏览器没有可用于 Adobe 登录续期的 Cookie，请重新登录")
 	}
 	account.AccessToken = session.AccessToken
-	account.ARPSession = sanitizeARPSession(session.ARPSession)
+	account.ARPSession = session.ARPSession
 	account.UserID = session.Profile.UserID
 	account.ExpiresAt = parseBrowserExpiry(session.ExpiresAt, session.AccessToken)
 	account.LastRefresh = time.Now().UTC()

@@ -9,14 +9,14 @@ const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url')
 const initial = encode({sid:'测试会话编号'});
 const complete = phase => encode({sid:'测试会话编号',ftr:'测试验证数据'+phase,ark:'测试验证数据',bfp:'测试验证数据'});
 
-async function run(events) {
+async function run(events, componentDelay = 0) {
  let now = 100000, sequence = 0, latest = null, settled = false, result, error;
  const tasks = new Map(), observers = new Set();
  const schedule = (callback, delay) => {const id=++sequence;tasks.set(id,{at:now+delay,callback});return id;};
  for(const [offset,value] of events)schedule(()=>{latest=value;for(const observer of observers)observer(value);},offset);
  const immediate = value => callback => {callback(value);return ()=>{};};
  const auth = {accessToken:immediate('测试访问令牌'),userProfile:immediate({userId:'测试用户'}),arpSessionToken:callback=>{observers.add(callback);callback(latest);return ()=>observers.delete(callback);}};
- const context = {Date:class extends Date {static now(){return now;}},setTimeout:schedule,clearTimeout:id=>tasks.delete(id),queueMicrotask,atob,window:{adobeIMS:{refreshToken:async()=>{},getAccessToken:()=>({expire:200000})}},document:{querySelector:()=>({__reactFiberFixture:{memoizedProps:{service:{host:{authentication:auth}}}}})}};
+ const context = {Date:class extends Date {static now(){return now;}},setTimeout:schedule,clearTimeout:id=>tasks.delete(id),queueMicrotask,atob,window:{adobeIMS:{refreshToken:async()=>{},getAccessToken:()=>({expire:200000})}},document:{querySelector:()=>now-100000<componentDelay?null:({__reactFiberFixture:{memoizedProps:{service:{host:{authentication:auth}}}}})}};
  Promise.resolve(vm.runInNewContext(script,context)).then(value=>{result=value;settled=true;},failure=>{error=failure;settled=true;});
  while(!settled&&now<180000){
   await new Promise(resolve=>setImmediate(resolve));
@@ -75,5 +75,10 @@ async function run(events) {
  const existing=await run([[0,complete(8)]]);
  assert.equal(existing.result.arp_session,complete(8));
  assert.ok(existing.elapsed>=20000);
+ // 慢页面不能消耗后续会话采集的等待窗口。
+ const slowPage=await run([[0,complete(8)]],45000);
+ assert.equal(slowPage.error,undefined);
+ assert.equal(slowPage.result.arp_session,complete(8));
+ assert.ok(slowPage.elapsed>=65000);
  console.log('浏览器会话初始化测试通过：异常格式拒绝、合法供应商对象、部分凭据、周期更新与稳定窗口');
 })().catch(error=>{console.error(error.message);process.exitCode=1;});
