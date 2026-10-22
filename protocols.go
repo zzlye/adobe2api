@@ -167,8 +167,8 @@ func appendReference(input *GenerateInput, image ImageRecord) error {
 	return nil
 }
 
-// saveReference 只读取短文件头识别格式，图片本体由存储层流式写入磁盘。
-func (a *App) saveReference(reader io.Reader, declared string) (ImageRecord, error) {
+// saveReference 只读取短文件头识别真实图片格式，忽略客户端或中转声明的不准确 MIME（如固定声明 image/png 但实际为 JPEG/WebP）。
+func (a *App) saveReference(reader io.Reader, _ string) (ImageRecord, error) {
 	buffered := bufio.NewReaderSize(reader, 512)
 	head, err := buffered.Peek(512)
 	if err != nil && err != io.EOF && err != bufio.ErrBufferFull {
@@ -180,12 +180,6 @@ func (a *App) saveReference(reader io.Reader, declared string) (ImageRecord, err
 	}
 	if !hasString([]string{"image/png", "image/jpeg", "image/webp", "image/gif", "image/avif"}, actual) {
 		return ImageRecord{}, errors.New("参考图格式无效，仅支持 PNG、JPEG、WebP、GIF、AVIF")
-	}
-	if declared != "" {
-		requested, _, parseErr := mime.ParseMediaType(declared)
-		if parseErr != nil || (requested != "application/octet-stream" && requested != actual) {
-			return ImageRecord{}, errors.New("参考图 MIME 类型与文件内容不一致")
-		}
 	}
 	return a.store.SaveImage(buffered, actual, "reference")
 }

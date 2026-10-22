@@ -189,6 +189,12 @@ func TestProtocolMultipartAndDataURLReferences(t *testing.T) {
 	if len(fake.input.References) != 1 || fake.input.References[0].MIME != "image/png" {
 		t.Fatal("Data URL参考图格式错误")
 	}
+	// 中转或客户端声明的 MIME 与实际图片文件头不一致时，应自动按真实文件头识别而不报错。
+	response = protocolRequest(app, "POST", "/v1/images/edits", map[string]any{"prompt": "声明MIME不一致兼容", "images": []any{map[string]string{"image_url": "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(data)}}})
+	requireProtocolStatus(t, response, 200)
+	if len(fake.input.References) != 1 || fake.input.References[0].MIME != "image/png" {
+		t.Fatal("未按真实图片文件头修正参考图 MIME")
+	}
 	response = protocolRequest(app, "POST", "/v1/images/edits", map[string]any{"prompt": "无效遮罩", "mask": "file-mask", "images": []any{map[string]string{"image_url": "data:image/png;base64," + base64.StdEncoding.EncodeToString(data)}}})
 	requireProtocolStatus(t, response, 400)
 }
