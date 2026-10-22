@@ -78,9 +78,10 @@ const browserSessionScript = `(async () => {
   }
   return null;
  };
- const deadline=Date.now()+60000;
+ const findDeadline=Date.now()+60000;
  let auth;
- while(!(auth=find())){if(Date.now()>deadline)throw new Error('Adobe 生图页面未加载完成，请检查网络后重试');await new Promise(r=>setTimeout(r,500))}
+ while(!(auth=find())){if(Date.now()>findDeadline)throw new Error('Adobe 生图页面未加载完成，请检查网络后重试');await new Promise(r=>setTimeout(r,500))}
+ const deadline=Date.now()+60000;
  try{if(window.adobeIMS)await window.adobeIMS.refreshToken()}catch{}
  let token,arp,profile;
  do {
@@ -110,7 +111,7 @@ func (a *App) refreshBrowser(ctx context.Context, account Account) (Account, err
 	case <-ctx.Done():
 		return account, ctx.Err()
 	}
-	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 	endpoint := browserEndpointForAccount(account, os.Getenv("ADOBE2API_CDP_URL"))
 	updated, err := a.refreshBrowserSession(ctx, account, endpoint)
