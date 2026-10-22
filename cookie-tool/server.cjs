@@ -1,5 +1,5 @@
-// Adobe 账号自动登录与 Cookie（含风险会话 sherlockToken）提取工具
-// 启动后访问 http://127.0.0.1:18899 即可输入账号密码或完整卡密行，自动完成登录、验证码收取、风险会话提取并清理本地浏览器缓存。
+// Adobe 账号自动登录与 Cookie（含风险会话 sherlockToken）可视化提取工具
+// 双击「启动Cookie提取工具.bat」自动打开 GUI 界面（http://127.0.0.1:18899）
 
 const http = require('http');
 const fs = require('fs');
@@ -25,20 +25,24 @@ function findBrowserPath() {
   throw new Error('未找到 Chrome 或 Edge 浏览器，请确认已安装 Chrome');
 }
 
-// 解析组合卡密行（支持 ---- 或 -— 或 —— 分隔）
+// 解析组合卡密行（支持 ----、-—、—— 等分隔符）
 function parseAccountLine(raw) {
   const line = String(raw || '').trim();
   if (!line) return null;
   const parts = line.split(/(?:-+|—+|\u2014+){2,}|-\u2014|\u2014-/).map(s => s.trim()).filter(Boolean);
-  if (parts.length >= 6) {
-    return {
-      email: parts[0],
-      emailPassword: parts[1],
-      mailClientId: parts[2],
-      mailRefreshToken: parts[3],
-      note: parts[4],
-      adobePassword: parts[parts.length - 1]
-    };
+  if (parts.length >= 4) {
+    const email = parts[0];
+    const emailPassword = parts[1] || '';
+    const mailClientId = parts[2] || '';
+    const mailRefreshToken = parts[3] || '';
+    let note = parts[4] || '';
+    let adobePassword = parts.length >= 6 ? parts[parts.length - 1] : '';
+    // 如果倒数第二项本身是 refresh_token 的尾部（如 Pzh3LO3Q$$），则最后一项是备注而非密码
+    if (parts.length === 6 && mailRefreshToken.endsWith(parts[4])) {
+      note = parts[5];
+      adobePassword = '';
+    }
+    return { email, emailPassword, mailClientId, mailRefreshToken, note, adobePassword };
   }
   if (parts.length === 2) {
     return { email: parts[0], adobePassword: parts[1] };
@@ -46,49 +50,53 @@ function parseAccountLine(raw) {
   return null;
 }
 
-// 通过微软 OAuth2 refresh_token 自动从 Outlook 收件箱读取最新 Adobe 6 位验证码
-async function fetchOutlookAdobeCode(clientId, refreshToken, afterTimestampMs) {
-  if (!clientId || !refreshToken) return null;
-  for (const endpoint of [
-    'https://login.microsoftonline.com/common/oauth2/v2.0/token',
-    'https://login.live.com/oauth20_token.srf'
-  ]) {
-    try {
-      const tokenRes = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          client_id: clientId,
-          grant_type: 'refresh_token',
-          refresh_token: refreshToken
-        })
-      });
-      const tokenData = await tokenRes.json();
-      if (!tokenData.access_token) continue;
+// 通过微软 Graph API 读取最新一封邮件的 ID 与 6 位 Adobe 验证码
+async function fetchLatestOutlookCode(clientId, refreshToken) {
+  if (!clientId || !refreshToken) return { id: '', code: null };
+  try {
+    const tokenRes = await fetch('https://login.microsoftonline.com/common/oauth2/v2.0/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        scope: 'https://graph.microsoft.com/.default'
+      })
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) return { id: '', code: null };
 
-      const mailRes = await fetch(
-        'https://graph.microsoft.com/v1.0/me/messages?$top=8&$select=subject,receivedDateTime,bodyPreview,body',
-        { headers: { Authorization: `Bearer ${tokenData.access_token}` } }
-      );
-      const mailData = await mailRes.json();
-      const messages = Array.isArray(mailData.value) ? mailData.value : [];
-      for (const msg of messages) {
-        const receivedAt = Date.parse(msg.receivedDateTime || '') || 0;
-        if (afterTimestampMs && receivedAt + 60000 < afterTimestampMs) continue;
-        const text = `${msg.subject || ''} ${msg.bodyPreview || ''} ${(msg.body && msg.body.content) || ''}`;
-        if (!/adobe|verification|code|验证码/i.test(text)) continue;
-        const match = text.match(/\b(\d{6})\b/);
-        if (match) return match[1];
-      }
-    } catch {
-      // 忽略单次拉取错误，外层轮询重试
+    const mailRes = await fetch(
+      'https://graph.microsoft.com/v1.0/me/messages?$top=3&$select=id,subject,receivedDateTime,bodyPreview,body',
+      { headers: { Authorization: `Bearer ${tokenData.access_token}` } }
+    );
+    const mailData = await mailRes.json();
+    const messages = Array.isArray(mailData.value) ? mailData.value : [];
+    for (const msg of messages) {
+      const rawHtml = (msg.body && msg.body.content) || '';
+      const plain = rawHtml
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;|&#\d+;|[\u200B-\u200D\uFEFF]/g, ' ')
+        .replace(/\s+/g, ' ');
+      const text = `${msg.subject || ''} ${msg.bodyPreview || ''} ${plain}`;
+      if (!/adobe|authentication code|verification code|验证码/i.test(text)) continue;
+      const match = plain.match(/\b(\d{6})\b/) || text.match(/\b(\d{6})\b/);
+      if (match) return { id: msg.id, code: match[1] };
     }
-  }
-  return null;
+  } catch {}
+  return { id: '', code: null };
 }
 
+let currentStatus = '就绪';
+
 // 执行单次账号自动登录与 Cookie 提取
-async function extractAdobeCookie(params, onProgress = () => {}) {
+async function extractAdobeCookie(params) {
+  const log = msg => {
+    currentStatus = msg;
+    console.log('[提取进度]', msg);
+  };
   const parsed = parseAccountLine(params.accountLine) || {};
   const email = (params.email || parsed.email || '').trim();
   const adobePassword = (params.adobePassword || parsed.adobePassword || '').trim();
@@ -96,19 +104,21 @@ async function extractAdobeCookie(params, onProgress = () => {}) {
   const mailRefreshToken = (params.mailRefreshToken || parsed.mailRefreshToken || '').trim();
   const note = (params.note || parsed.note || '').trim();
 
-  if (!email || !adobePassword) {
-    throw new Error('请填写 Adobe 邮箱账号和 Adobe 登录密码（或粘贴完整卡密行）');
+  if (!email) {
+    throw new Error('请填写 Adobe 邮箱账号（或粘贴完整卡密行）');
+  }
+  if (!adobePassword && (!mailClientId || !mailRefreshToken)) {
+    throw new Error('请填写 Adobe 登录密码，或提供微软邮箱 Client ID + Refresh Token 以使用邮箱验证码登录');
   }
 
   fs.mkdirSync(TMP_ROOT, { recursive: true });
   const profileDir = path.join(TMP_ROOT, `adobe-cookie-tool-${Date.now()}`);
-  const debugPort = 19222 + Math.floor(Math.random() * 500);
+  const debugPort = 19300 + Math.floor(Math.random() * 400);
   const browserPath = findBrowserPath();
 
-  const loginUrl =
-    'https://auth.services.adobe.com/en_US/index.html?callback=https%3A%2F%2Fims-na1.adobelogin.com%2Fims%2Fadobeid%2Fclio-playground-web%2FAdobeID%2Ftoken%3Fredirect_uri%3Dhttps%253A%252F%252Ffirefly.adobe.com%252Fgenerate%252Fimage&client_id=clio-playground-web&scope=AdobeID%2Cfirefly_api%2Copenid%2Cpps.read%2Cpps.write%2Cadditional_info.projectedProductContext%2Cadditional_info.ownerOrg%2Cuds_read%2Cuds_write%2Cab.manage%2Cread_organizations%2Cadditional_info.roles%2Caccount_cluster.read%2Ccreative_production%2Ctk_platform%2Ctk_platform_sync%2Caf_byof%2Cprofile%2Cdii_lr_ml_unlimited&state=%7B%22ac%22%3A%22firefly.adobe.com%22%7D&locale=en_US&flow_type=token&idp_flow_type=login';
+  log('正在读取邮箱初始状态并启动独立浏览器...');
+  const beforeMail = await fetchLatestOutlookCode(mailClientId, mailRefreshToken);
 
-  onProgress('正在启动独立隔离浏览器...');
   const child = spawn(
     browserPath,
     [
@@ -116,7 +126,7 @@ async function extractAdobeCookie(params, onProgress = () => {}) {
       `--user-data-dir=${profileDir}`,
       '--no-first-run',
       '--no-default-browser-check',
-      'about:blank'
+      'https://account.adobe.com/'
     ],
     { detached: false, stdio: 'ignore' }
   );
@@ -135,10 +145,9 @@ async function extractAdobeCookie(params, onProgress = () => {}) {
   };
 
   try {
-    // 等待 CDP 端口就绪
     let pageTarget = null;
-    for (let i = 0; i < 25; i++) {
-      await new Promise(r => setTimeout(r, 400));
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 500));
       try {
         const res = await fetch(`http://127.0.0.1:${debugPort}/json/list`);
         const list = await res.json();
@@ -175,10 +184,7 @@ async function extractAdobeCookie(params, onProgress = () => {}) {
         ws.send(JSON.stringify({ id, method, params: cmdParams }));
       });
 
-    onProgress(`正在打开 Adobe 登录页并填写邮箱 ${email}...`);
-    await send('Page.navigate', { url: loginUrl });
-
-    // 等待邮箱输入框出现
+    log(`正在等待 Adobe 登录框并输入邮箱 ${email}...`);
     for (let i = 0; i < 30; i++) {
       await new Promise(r => setTimeout(r, 1000));
       const check = await send('Runtime.evaluate', {
@@ -200,31 +206,37 @@ async function extractAdobeCookie(params, onProgress = () => {}) {
       })()`
     });
     await send('Input.insertText', { text: email });
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 600));
     await send('Runtime.evaluate', {
       expression: `document.querySelector('[data-id=EmailPage-ContinueButton]')?.click()`
     });
 
-    onProgress('正在等待密码输入框或验证码挑战...');
-    for (let step = 0; step < 45; step++) {
-      await new Promise(r => setTimeout(r, 1200));
+    await new Promise(r => setTimeout(r, 7000));
+
+    // 如果提供了微软邮箱令牌且未填密码（或优先使用一次性验证码），自动点一次性验证码登录
+    let loggedIn = false;
+    for (let step = 0; step < 35; step++) {
+      await new Promise(r => setTimeout(r, 1500));
       const stateRes = await send('Runtime.evaluate', {
         expression: `JSON.stringify({
           url: location.href,
           hasPwd: Boolean(document.querySelector('#PasswordPage-PasswordField')),
-          hasCodeInput: Boolean(document.querySelector('[data-id=CodeInput-0], input[autocomplete=one-time-code]')),
-          hasVerifyBtn: location.hash.includes('challenge/verify') && Boolean(document.querySelector('button[data-id=ChallengePushPage-Continue], button[type=submit]')),
+          hasOtpBtn: Array.from(document.querySelectorAll('button, a')).some(b => /one-time code|sign in with a code|验证码/i.test(b.innerText)),
+          hasCodeBoxes: document.querySelectorAll('[data-id^=CodeInput-], input[inputmode=numeric]').length > 0,
           hasSkipPhone: location.hash.includes('add-security-phone-number') || Boolean(document.querySelector('[data-id=PP-AddSecurityPhoneNumber-skip-btn]')),
-          hasFirefly: location.hostname === 'firefly.adobe.com'
+          isAccountHome: location.hostname === 'account.adobe.com'
         })`,
         returnByValue: true
       });
       const st = JSON.parse(stateRes.result.value);
 
-      if (st.hasFirefly) break;
+      if (st.isAccountHome) {
+        loggedIn = true;
+        break;
+      }
 
       if (st.hasSkipPhone) {
-        onProgress('检测到绑定手机号提示，正在自动跳过...');
+        log('正在自动跳过绑定手机号提示...');
         await send('Runtime.evaluate', {
           expression: `(() => {
             const btn = document.querySelector('[data-id=PP-AddSecurityPhoneNumber-skip-btn]') ||
@@ -235,8 +247,8 @@ async function extractAdobeCookie(params, onProgress = () => {}) {
         continue;
       }
 
-      if (st.hasPwd) {
-        onProgress('正在自动填写 Adobe 密码并勾选保持登录...');
+      if (st.hasPwd && adobePassword) {
+        log('正在输入 Adobe 密码并勾选保持登录...');
         await send('Runtime.evaluate', {
           expression: `(() => {
             const el = document.querySelector('#PasswordPage-PasswordField');
@@ -251,55 +263,63 @@ async function extractAdobeCookie(params, onProgress = () => {}) {
           })()`
         });
         await send('Input.insertText', { text: adobePassword });
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 600));
         await send('Runtime.evaluate', {
           expression: `document.querySelector('[data-id=PasswordPage-ContinueButton]')?.click()`
         });
-        await new Promise(r => setTimeout(r, 4000));
+        await new Promise(r => setTimeout(r, 5000));
         continue;
       }
 
-      if (st.hasVerifyBtn && !st.hasCodeInput) {
-        onProgress('触发邮箱身份验证，正在请求发送验证码...');
-        const sendTime = Date.now();
+      if (st.hasOtpBtn && !st.hasCodeBoxes && mailClientId && mailRefreshToken) {
+        log('正在点击「邮箱一次性验证码登录」并从 Outlook 自动收取验证码...');
         await send('Runtime.evaluate', {
           expression: `(() => {
-            const btn = document.querySelector('button[data-id=ChallengePushPage-Continue], button[type=submit]') ||
-              Array.from(document.querySelectorAll('button')).find(b => /continue|继续/i.test(b.innerText));
-            if (btn) btn.click();
+            const remember = document.querySelector('input[type=checkbox]');
+            if (remember && !remember.checked) remember.click();
+            const otpBtn = Array.from(document.querySelectorAll('button, a')).find(b => /one-time code|sign in with a code|验证码/i.test(b.innerText));
+            if (otpBtn) otpBtn.click();
           })()`
         });
-        await new Promise(r => setTimeout(r, 4000));
-        if (mailClientId && mailRefreshToken) {
-          onProgress('正在通过邮箱令牌自动读取 Outlook 验证码...');
-          for (let retry = 0; retry < 10; retry++) {
-            await new Promise(r => setTimeout(r, 3000));
-            const code = await fetchOutlookAdobeCode(mailClientId, mailRefreshToken, sendTime);
-            if (code) {
-              onProgress(`已自动获取邮箱验证码 ${code}，正在填入...`);
-              await send('Runtime.evaluate', {
-                expression: `(() => {
-                  const first = document.querySelector('[data-id=CodeInput-0], input[autocomplete=one-time-code], input[type=number], input[type=text]');
-                  if (first) first.focus();
-                })()`
-              });
-              await send('Input.insertText', { text: code });
-              await new Promise(r => setTimeout(r, 1000));
-              await send('Runtime.evaluate', {
-                expression: `document.querySelector('button[type=submit]')?.click()`
-              });
-              break;
-            }
-          }
-        } else {
-          onProgress('请在弹出的浏览器窗口中手动输入邮箱收到的 6 位验证码...');
-        }
+        await new Promise(r => setTimeout(r, 3000));
         continue;
+      }
+
+      if (st.hasCodeBoxes && mailClientId && mailRefreshToken) {
+        log('正在轮询 Outlook 收件箱获取最新 6 位验证码...');
+        let code = null;
+        for (let r = 0; r < 18; r++) {
+          await new Promise(res => setTimeout(res, 2500));
+          const cur = await fetchLatestOutlookCode(mailClientId, mailRefreshToken);
+          if (cur.id && cur.id !== beforeMail.id && cur.code) {
+            code = cur.code;
+            break;
+          }
+        }
+        if (!code) throw new Error('等待 Outlook 验证码邮件超时');
+        log(`已自动收到验证码 ${code}，正在填入...`);
+        for (let d = 0; d < 6; d++) {
+          await send('Runtime.evaluate', {
+            expression: `(() => {
+              const boxes = document.querySelectorAll('[data-id^=CodeInput-], input[inputmode=numeric]');
+              const box = boxes[${d}] || boxes[0];
+              if (box) box.focus();
+            })()`
+          });
+          await send('Input.insertText', { text: code[d] });
+          await new Promise(res => setTimeout(res, 150));
+        }
+        await new Promise(res => setTimeout(res, 1500));
+        await send('Runtime.evaluate', {
+          expression: `document.querySelector('button[type=submit], [data-id*=Continue]')?.click()`
+        });
+        await new Promise(res => setTimeout(res, 5000));
       }
     }
 
-    onProgress('已进入 Firefly 页面，正在等待风险会话（ftr / sherlockToken）生成（约 22 秒）...');
-    for (let i = 0; i < 35; i++) {
+    log('登录成功！正在进入 Firefly 生图页采集风险会话（约 25 秒）...');
+    await send('Page.navigate', { url: 'https://firefly.adobe.com/generate/image' });
+    for (let i = 0; i < 30; i++) {
       await new Promise(r => setTimeout(r, 2000));
       const check = await send('Runtime.evaluate', {
         expression: `JSON.stringify({ url: location.href, hasEl: Boolean(document.querySelector('firefly-image-generation')) })`,
@@ -307,18 +327,17 @@ async function extractAdobeCookie(params, onProgress = () => {}) {
       });
       const st = JSON.parse(check.result.value);
       if (st.url.includes('denied.html')) {
-        throw new Error('当前网络节点地区不受 Adobe Firefly 支持（跳转到 denied.html），请开启美国/支持地区 VPN 后重试');
+        throw new Error('当前网络节点不受 Adobe Firefly 支持（denied.html），请开启美国/支持地区 VPN 后重试');
       }
       if (st.hasEl) break;
     }
 
-    // 等待 22 秒让 Forter (ftr) 与指纹完成采集
     await new Promise(r => setTimeout(r, 22000));
 
     const evalRes = await send('Runtime.evaluate', {
       expression: `(async () => {
         const el = document.querySelector('firefly-image-generation');
-        if (!el) return JSON.stringify({ error: '未加载出 Firefly 生图组件，请检查网络节点' });
+        if (!el) return JSON.stringify({ error: '未加载出 Firefly 生图组件' });
         const key = Object.keys(el).find(k => k.startsWith('__reactFiber'));
         let fiber = el[key];
         let auth;
@@ -333,6 +352,14 @@ async function extractAdobeCookie(params, onProgress = () => {}) {
           let d;
           d = s(v => { if (typeof d === 'function') d(); resolve(v); });
         });
+        for (let i = 0; i < 12; i++) {
+          const [token, arp, profile] = await Promise.all([read(auth.accessToken), read(auth.arpSessionToken), read(auth.userProfile)]);
+          try {
+            const decoded = JSON.parse(atob(arp));
+            if (decoded.ftr) return JSON.stringify({ token, arp, profile });
+          } catch {}
+          await new Promise(r => setTimeout(r, 2000));
+        }
         const [token, arp, profile] = await Promise.all([read(auth.accessToken), read(auth.arpSessionToken), read(auth.userProfile)]);
         return JSON.stringify({ token, arp, profile });
       })()`,
@@ -348,7 +375,6 @@ async function extractAdobeCookie(params, onProgress = () => {}) {
     const cookiesRes = await send('Network.getAllCookies');
     ws.close();
 
-    // 过滤出 Adobe 相关 Cookie，并将本次新鲜采集的 arp_session 写入 sherlockToken
     const filteredCookies = cookiesRes.cookies.filter(
       c => c.domain.includes('adobe') && c.name !== 'edge_geo_country' && c.name !== 'sherlockToken'
     );
@@ -356,7 +382,6 @@ async function extractAdobeCookie(params, onProgress = () => {}) {
     cookiePairs.push(`sherlockToken=${session.arp}`);
     const fullCookie = `${email}----${cookiePairs.join('; ')}`;
 
-    // 查询该账号当前积分与套餐状态
     let creditsInfo = null;
     try {
       const credRes = await fetch('https://firefly.adobe.io/v1/credits/balance', {
@@ -371,17 +396,18 @@ async function extractAdobeCookie(params, onProgress = () => {}) {
       creditsInfo = await credRes.json();
     } catch {}
 
+    log('提取完成！本地临时浏览器已关闭并清理。');
     return {
       email,
       note: note || email,
       userId: session.profile?.userId || '',
-      cookie: fullCookie,
+      token: session.token,
       arpSession: session.arp,
+      cookie: fullCookie,
       credits: creditsInfo?.total?.quota || null,
       planCap: creditsInfo?.total?.planCap || ''
     };
   } finally {
-    // 无论成功或失败，立即关闭本地临时浏览器并删除缓存目录，避免本地浏览器刷新 ftr 顶掉服务器会话
     cleanup();
   }
 }
@@ -390,14 +416,14 @@ const HTML_PAGE = `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>Adobe Cookie 自动提取工具</title>
+  <title>Adobe Cookie 自动提取工具 (GUI)</title>
   <style>
     :root { --brand: #5758d6; --bg: #f7f8fa; --ink: #242733; --line: #e4e6ed; }
     * { box-sizing: border-box; }
     body { margin: 0; padding: 36px 20px; font-family: "Microsoft YaHei", Inter, sans-serif; background: var(--bg); color: var(--ink); }
     .wrap { max-width: 760px; margin: 0 auto; background: #fff; border: 1px solid var(--line); border-radius: 16px; padding: 28px 32px; box-shadow: 0 8px 30px rgba(37,42,65,.05); }
     h1 { margin: 0 0 6px; font-size: 22px; }
-    .sub { margin: 0 0 22px; font-size: 13px; color: #7c808f; }
+    .sub { margin: 0 0 22px; font-size: 13px; color: #7c808f; line-height: 1.6; }
     label { display: block; font-size: 13px; font-weight: 600; margin-top: 16px; color: #4c5160; }
     input, textarea { width: 100%; margin-top: 7px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; font: inherit; font-size: 13px; }
     textarea { resize: vertical; font-family: Consolas, monospace; font-size: 12px; line-height: 1.5; }
@@ -414,33 +440,33 @@ const HTML_PAGE = `<!doctype html>
 <body>
   <div class="wrap">
     <h1>Adobe 账号自动登录与 Cookie 提取工具</h1>
-    <p class="sub">提取完成后会自动关闭并销毁本地临时浏览器缓存，复制生成的 Cookie 直接去服务器「添加账号 -> Cookie 导入」粘贴即可。</p>
+    <p class="sub">支持直接粘贴卡密行或分项输入。若卡密含微软邮箱令牌，即使没有 Adobe 密码也会自动通过 Outlook 收取 6 位验证码登录。提取完成后自动关闭并清理本地临时浏览器，复制结果直接粘贴到服务器「添加账号 -> Cookie 导入」即可。</p>
     <form id="form">
-      <label>方式一：直接粘贴完整卡密行（自动识别邮箱、Adobe密码与微软令牌）
-        <textarea id="accountLine" rows="3" placeholder="例如：VanderBowen4891@outlook.com----邮箱密码----client_id----refresh_token----备注----Adobe密码"></textarea>
+      <label>方式一：直接粘贴完整卡密行（自动解析邮箱、微软令牌、密码）
+        <textarea id="accountLine" rows="3" placeholder="粘贴如：WaylonCapri8820@outlook.com-—my369352-—9e5f94bc...-—M.C562_BL2...-—4k"></textarea>
       </label>
       <div class="grid">
         <label>方式二：Adobe 账号（邮箱）
           <input id="email" placeholder="如已填上方卡密行可留空">
         </label>
-        <label>Adobe 登录密码
-          <input id="adobePassword" placeholder="如已填上方卡密行可留空">
+        <label>Adobe 登录密码（可留空走邮箱验证码登录）
+          <input id="adobePassword" placeholder="留空则使用微软令牌自动收验证码">
         </label>
       </div>
       <div class="grid">
-        <label>微软邮箱 Client ID（选填，用于自动收验证码）
+        <label>微软邮箱 Client ID（选填）
           <input id="mailClientId" placeholder="选填">
         </label>
-        <label>微软邮箱 Refresh Token（选填，用于自动收验证码）
+        <label>微软邮箱 Refresh Token（选填）
           <input id="mailRefreshToken" placeholder="选填">
         </label>
       </div>
-      <button id="submitBtn" class="btn" type="submit">一键登录并提取 Cookie</button>
+      <button id="submitBtn" class="btn" type="submit">一键自动登录并提取 Cookie</button>
     </form>
     <div id="statusBox" class="status"></div>
     <div id="resultBox" class="result">
       <div id="resultMeta" class="meta"></div>
-      <label>提取结果（含邮箱前缀与 sherlockToken 风险会话，可直接粘贴到服务器后台「Cookie 导入」）：
+      <label>提取结果（可直接粘贴到服务器后台「添加账号 -> Cookie 导入」）：
         <textarea id="cookieOutput" rows="6" readonly></textarea>
       </label>
       <button id="copyBtn" class="btn btn-copy" type="button">一键复制 Cookie</button>
@@ -454,6 +480,7 @@ const HTML_PAGE = `<!doctype html>
     const cookieOutput = document.getElementById('cookieOutput');
     const submitBtn = document.getElementById('submitBtn');
     const copyBtn = document.getElementById('copyBtn');
+    let timer = null;
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -461,7 +488,13 @@ const HTML_PAGE = `<!doctype html>
       resultBox.style.display = 'none';
       statusBox.className = 'status';
       statusBox.style.display = 'block';
-      statusBox.textContent = '正在启动独立浏览器并执行自动登录（全流程约 35～50 秒，请勿关闭窗口）...';
+      statusBox.textContent = '正在启动...';
+      timer = setInterval(async () => {
+        try {
+          const st = await (await fetch('/api/status')).json();
+          if (st.status) statusBox.textContent = st.status;
+        } catch {}
+      }, 1000);
       try {
         const res = await fetch('/api/extract', {
           method: 'POST',
@@ -485,6 +518,7 @@ const HTML_PAGE = `<!doctype html>
         statusBox.className = 'status error';
         statusBox.textContent = '提取失败：' + err.message;
       } finally {
+        clearInterval(timer);
         submitBtn.disabled = false;
       }
     });
@@ -498,36 +532,48 @@ const HTML_PAGE = `<!doctype html>
 </body>
 </html>`;
 
-const server = http.createServer(async (req, res) => {
-  if (req.method === 'GET' && (req.url === '/' || req.url.startsWith('/?'))) {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(HTML_PAGE);
-    return;
-  }
-  if (req.method === 'POST' && req.url === '/api/extract') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', async () => {
-      try {
-        const payload = JSON.parse(body || '{}');
-        const result = await extractAdobeCookie(payload, msg => console.log('[提取进度]', msg));
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify(result));
-      } catch (err) {
-        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: err.message || String(err) }));
-      }
-    });
-    return;
-  }
-  res.writeHead(404);
-  res.end('Not Found');
-});
+if (require.main === module) {
+  const server = http.createServer(async (req, res) => {
+    if (req.method === 'GET' && (req.url === '/' || req.url.startsWith('/?'))) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(HTML_PAGE);
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/api/status') {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ status: currentStatus }));
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/api/extract') {
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const payload = JSON.parse(body || '{}');
+          const result = await extractAdobeCookie(payload);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(result));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: err.message || String(err) }));
+        }
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end('Not Found');
+  });
 
-server.listen(PORT, '127.0.0.1', () => {
-  const url = `http://127.0.0.1:${PORT}`;
-  console.log(`Adobe Cookie 自动提取工具已启动：${url}`);
-  try {
-    execSync(`start "" "${url}"`, { stdio: 'ignore' });
-  } catch {}
-});
+  server.listen(PORT, '127.0.0.1', () => {
+    const url = `http://127.0.0.1:${PORT}`;
+    console.log(`Adobe Cookie 自动提取工具 (GUI) 已启动：${url}`);
+    try {
+      const browserPath = findBrowserPath();
+      spawn(browserPath, [`--app=${url}`, '--window-size=840,780'], { detached: true, stdio: 'ignore' }).unref();
+    } catch {
+      try { execSync(`start "" "${url}"`, { stdio: 'ignore' }); } catch {}
+    }
+  });
+}
+
+module.exports = { extractAdobeCookie, parseAccountLine };
