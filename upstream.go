@@ -54,10 +54,13 @@ type UpstreamError struct {
 }
 
 func (e *UpstreamError) Error() string {
-	if e.Code == "" {
-		return fmt.Sprintf("Adobe 请求失败（%d）：%s", e.StatusCode, e.Message)
+	if strings.TrimSpace(e.Message) != "" {
+		return e.Message
 	}
-	return fmt.Sprintf("Adobe 请求失败（%d/%s）：%s", e.StatusCode, e.Code, e.Message)
+	if e.Code == "" {
+		return fmt.Sprintf("请求失败（%d）", e.StatusCode)
+	}
+	return fmt.Sprintf("请求失败（%d/%s）", e.StatusCode, e.Code)
 }
 
 func (g *AdobeGenerator) clients() (*http.Client, *http.Client, error) {
@@ -264,7 +267,7 @@ func (g *AdobeGenerator) do(client *http.Client, request *http.Request, log *Req
 			return nil, request.Context().Err()
 		}
 		// 网络错误不返回原始 URL，避免签名参数出现在错误日志中。
-		return nil, errors.New("连接 Adobe 失败，请检查网络与代理设置")
+		return nil, errors.New("连接上游失败，请检查网络与代理设置")
 	}
 	return response, nil
 }
@@ -302,10 +305,10 @@ func decodeAdobeResponse(response *http.Response) (adobeGenerationResponse, erro
 		if errors.Is(err, context.Canceled) {
 			return adobeGenerationResponse{}, context.Canceled
 		}
-		return adobeGenerationResponse{}, errors.New("读取 Adobe 响应失败")
+		return adobeGenerationResponse{}, errors.New("读取上游响应失败")
 	}
 	if len(body) > 2<<20 {
-		return adobeGenerationResponse{}, errors.New("Adobe 响应超过允许大小")
+		return adobeGenerationResponse{}, errors.New("上游响应超过允许大小")
 	}
 	var payload adobeGenerationResponse
 	decodeErr := json.Unmarshal(body, &payload)
@@ -317,7 +320,7 @@ func decodeAdobeResponse(response *http.Response) (adobeGenerationResponse, erro
 		return payload, adobeUpstreamError(response, response.StatusCode, payload.ErrorCode, message)
 	}
 	if decodeErr != nil {
-		return payload, errors.New("Adobe 返回了无效响应")
+		return payload, errors.New("上游返回了无效响应")
 	}
 	if payload.ErrorCode != "" {
 		return payload, adobeUpstreamError(response, http.StatusBadGateway, payload.ErrorCode, payload.Message)
@@ -387,13 +390,13 @@ func (g *AdobeGenerator) uploadReference(ctx context.Context, client *http.Clien
 		Message   string `json:"message"`
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&payload); err != nil {
-		return "", errors.New("Adobe 参考图上传响应无效")
+		return "", errors.New("参考图上传响应无效")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return "", adobeUpstreamError(response, response.StatusCode, payload.ErrorCode, payload.Message)
 	}
 	if len(payload.Images) == 0 || payload.Images[0].ID == "" {
-		return "", errors.New("Adobe 未返回参考图标识")
+		return "", errors.New("上游未返回参考图标识")
 	}
 	return payload.Images[0].ID, nil
 }
@@ -596,7 +599,7 @@ func adobeGenerationBody(model Model, input GenerateInput, references []map[stri
 		return body, nil
 	}
 	if model.AdobeID != "gpt-image" {
-		return nil, errors.New("暂不支持该 Adobe 上游模型")
+		return nil, errors.New("暂不支持该上游模型")
 	}
 	if ratio == "auto" {
 		payload["size"] = "auto"
@@ -723,11 +726,11 @@ func (g *AdobeGenerator) Generate(ctx context.Context, account Account, input Ge
 			return result, err
 		}
 		if len(payload.Outputs) == 0 {
-			return result, errors.New("Adobe 未返回生成图片")
+			return result, errors.New("上游未返回生成图片")
 		}
 		for _, output := range payload.Outputs {
 			if len(output.Error) > 0 && string(output.Error) != "null" {
-				return result, errors.New("Adobe 拒绝或未能生成该图片")
+				return result, errors.New("未能生成该图片")
 			}
 			image, err := g.downloadImage(ctx, download, output.Image.PresignedURL, payload.ContentType, log)
 			if err != nil {
@@ -769,7 +772,7 @@ func (g *AdobeGenerator) poll(ctx context.Context, client *http.Client, account 
 			}
 		}
 		if resultURL == "" {
-			return payload, errors.New("Adobe 未返回图片生成任务地址")
+			return payload, errors.New("上游未返回图片生成任务地址")
 		}
 		if err := waitAdobe(ctx, adobeWaitDuration(header)); err != nil {
 			g.cancelJob(client, account, cancelURL, log)
@@ -817,7 +820,7 @@ func (g *AdobeGenerator) cancelJob(client *http.Client, account Account, address
 func (g *AdobeGenerator) downloadImage(ctx context.Context, client *http.Client, address, contentType string, log *RequestLog) (ImageRecord, error) {
 	parsed, err := url.Parse(address)
 	if err != nil || !isAdobeImageURL(parsed) {
-		return ImageRecord{}, errors.New("Adobe 返回的图片地址无效")
+		return ImageRecord{}, errors.New("生成的图片地址无效")
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
 	if err != nil {

@@ -491,7 +491,7 @@ func adobeUpstreamError(response *http.Response, status int, code, message strin
 	accessError = trimUpstreamLogText(redact(accessError), 256)
 	if status == http.StatusForbidden && accessError == "user_not_entitled" {
 		// 只替换对外错误，原始响应正文仍保留在脱敏后的接口日志中。
-		message = "当前Adobe账号没有所选模型的使用权限"
+		message = "当前账号没有所选模型的使用权限"
 	}
 	return &UpstreamError{StatusCode: status, Code: trimUpstreamLogText(redact(code), 256), Message: trimUpstreamLogText(redact(message), 1024), AccessError: accessError}
 }

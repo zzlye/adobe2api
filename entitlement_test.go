@@ -24,7 +24,7 @@ func TestAdobeEntitlementErrorKeepsOriginalResponseLog(t *testing.T) {
 	}
 	payload, err := decodeAdobeResponse(response)
 	var upstream *UpstreamError
-	if !errors.As(err, &upstream) || upstream.StatusCode != http.StatusForbidden || upstream.AccessError != "user_not_entitled" || upstream.Message != "当前Adobe账号没有所选模型的使用权限" {
+	if !errors.As(err, &upstream) || upstream.StatusCode != http.StatusForbidden || upstream.AccessError != "user_not_entitled" || upstream.Message != "当前账号没有所选模型的使用权限" {
 		t.Fatalf("模型无权限没有映射准确错误：%v", err)
 	}
 	if payload.Message != originalMessage || payload.ErrorCode != "forbidden" || len(log.Upstream) != 1 {

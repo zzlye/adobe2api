@@ -31,7 +31,7 @@ func TestDecodeAdobeResponsePreservesSafeContextReadErrors(t *testing.T) {
 				if err != test.want {
 					t.Fatal("正文读取未返回标准上下文错误")
 				}
-			} else if err == nil || err.Error() != "读取 Adobe 响应失败" || errors.Is(err, original) {
+			} else if err == nil || err.Error() != "读取上游响应失败" || errors.Is(err, original) {
 				t.Fatal("其他正文错误应转换为安全中文消息")
 			}
 			if strings.Contains(err.Error(), "read-url-secret-fixture") || strings.Contains(err.Error(), "https://") {
