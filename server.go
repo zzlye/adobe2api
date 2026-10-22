@@ -364,7 +364,8 @@ func (a *App) maintenance(ctx context.Context) {
 				continue
 			}
 			for _, account := range accounts {
-				if !account.Enabled || time.Since(account.LastRefresh) < time.Duration(settings.RefreshMinutes)*time.Minute {
+				needsARPRenew := account.Status == "error" && strings.Contains(account.LastError, "system under load")
+				if !account.Enabled || (!needsARPRenew && time.Since(account.LastRefresh) < time.Duration(settings.RefreshMinutes)*time.Minute) {
 					continue
 				}
 				a.poolMu.Lock()
@@ -385,8 +386,14 @@ func (a *App) maintenance(ctx context.Context) {
 				if inUse {
 					continue
 				}
+				refreshBase := account
+				if needsARPRenew {
+					// 风险会话过期导致 408 时重新通过浏览器采集新 ftr 凭据。
+					refreshBase.ARPSession = ""
+					refreshBase.Cookie = stripSherlockCookie(refreshBase.Cookie)
+				}
 				refreshCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-				refreshed, refreshErr := a.generator.Refresh(refreshCtx, account)
+				refreshed, refreshErr := a.generator.Refresh(refreshCtx, refreshBase)
 				cancel()
 				if refreshErr == nil {
 					_ = a.store.SaveAccount(refreshed)

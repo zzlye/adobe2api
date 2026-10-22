@@ -127,15 +127,21 @@ func TestAdobeBrowserCookieRecoveryUsesCurrentARP(t *testing.T) {
 	}
 }
 
-// 浏览器完整 Cookie 中的有效 sherlockToken 可直接作为风险会话，被风控标记（rid=100）的令牌必须忽略。
-func TestCookieARPSessionExtractsValidSherlockTokenAndRejectsFlaggedRisk(t *testing.T) {
+// 浏览器完整 Cookie 中的有效 sherlockToken 可直接作为风险会话，被风控标记（rid=100）的 ark 字段应自动剔除并保留有效 ftr/bfp。
+func TestCookieARPSessionExtractsValidSherlockTokenAndSanitizesFlaggedRisk(t *testing.T) {
 	validSherlock := base64.StdEncoding.EncodeToString([]byte(`{"sid":"valid-sid","ftr":"valid-ftr","ark":"token|rid=65|ag=101","bfp":"valid-bfp"}`))
 	flaggedSherlock := base64.StdEncoding.EncodeToString([]byte(`{"sid":"flagged-sid","ftr":"valid-ftr","ark":"token|rid=100|ag=101","bfp":"valid-bfp"}`))
+	arkOnlyFlagged := base64.StdEncoding.EncodeToString([]byte(`{"sid":"flagged-sid","ark":"token|rid=100|ag=101"}`))
 	if got := cookieARPSession("ims_sid=s1; sherlockToken=" + validSherlock); got != validSherlock {
 		t.Fatalf("未提取有效的 sherlockToken: %s", got)
 	}
-	if got := cookieARPSession("ims_sid=s1; sherlockToken=" + flaggedSherlock); got != "" {
-		t.Fatalf("不应采用触发风控 rid=100 的 sherlockToken: %s", got)
+	sanitized := cookieARPSession("ims_sid=s1; sherlockToken=" + flaggedSherlock)
+	decoded, err := base64.StdEncoding.DecodeString(sanitized)
+	if err != nil || string(decoded) != `{"bfp":"valid-bfp","ftr":"valid-ftr","sid":"flagged-sid"}` {
+		t.Fatalf("未清理触发风控 rid=100 的 ark 字段: %s", string(decoded))
+	}
+	if got := cookieARPSession("ims_sid=s1; sherlockToken=" + arkOnlyFlagged); got != "" {
+		t.Fatalf("仅含 rid=100 ark 的会话不应采用: %s", got)
 	}
 }
 

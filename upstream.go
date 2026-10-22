@@ -217,7 +217,7 @@ func adobeHeaders(request *http.Request, account Account, prompt string, generat
 	if generation {
 		request.Header.Set("X-Nonce", adobeNonce(adobeUserID(account), prompt))
 		if account.ARPSession != "" {
-			request.Header.Set("X-Arp-Session-Id", account.ARPSession)
+			request.Header.Set("X-Arp-Session-Id", sanitizeARPSession(account.ARPSession))
 		}
 	}
 }
@@ -1027,6 +1027,52 @@ func mergeAdobeCookies(raw string, incoming []*http.Cookie) string {
 	return strings.Join(pairs, "; ")
 }
 
+func stripSherlockCookie(raw string) string {
+	var parts []string
+	for _, pair := range strings.Split(raw, ";") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" || strings.HasPrefix(pair, "sherlockToken=") {
+			continue
+		}
+		parts = append(parts, pair)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// sanitizeARPSession 清理无头浏览器触发风控的 rid=100 Arkose 字段，保留有效的 sid、ftr 与 bfp 风险凭据。
+func sanitizeARPSession(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.NewReplacer("-", "+", "_", "/").Replace(value))
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(strings.NewReplacer("-", "+", "_", "/").Replace(strings.TrimRight(value, "=")))
+		if err != nil {
+			return value
+		}
+	}
+	var payload map[string]any
+	if json.Unmarshal(decoded, &payload) != nil {
+		return value
+	}
+	ark, _ := payload["ark"].(string)
+	if !strings.Contains(ark, "rid=100") {
+		return value
+	}
+	ftr, _ := payload["ftr"].(string)
+	bfp, _ := payload["bfp"].(string)
+	if strings.TrimSpace(ftr) == "" && strings.TrimSpace(bfp) == "" {
+		return ""
+	}
+	delete(payload, "ark")
+	cleaned, err := json.Marshal(payload)
+	if err != nil {
+		return value
+	}
+	return base64.StdEncoding.EncodeToString(cleaned)
+}
+
 // cookieARPSession 从导入的浏览器 Cookie 中提取已通过校验的 sherlockToken 风险会话，避免无头浏览器二次刷新触发 Arkose 风控（rid=100）。
 func cookieARPSession(raw string) string {
 	request := &http.Request{Header: http.Header{"Cookie": []string{raw}}}
@@ -1034,7 +1080,10 @@ func cookieARPSession(raw string) string {
 	if err != nil || strings.TrimSpace(cookie.Value) == "" {
 		return ""
 	}
-	value := strings.TrimSpace(cookie.Value)
+	value := sanitizeARPSession(cookie.Value)
+	if value == "" {
+		return ""
+	}
 	decoded, err := base64.StdEncoding.DecodeString(strings.NewReplacer("-", "+", "_", "/").Replace(value))
 	if err != nil {
 		decoded, err = base64.RawStdEncoding.DecodeString(strings.NewReplacer("-", "+", "_", "/").Replace(strings.TrimRight(value, "=")))
@@ -1051,10 +1100,10 @@ func cookieARPSession(raw string) string {
 	if json.Unmarshal(decoded, &payload) != nil {
 		return ""
 	}
-	if strings.TrimSpace(payload.SID) == "" || strings.TrimSpace(payload.ARK) == "" || strings.Contains(payload.ARK, "rid=100") {
+	if strings.TrimSpace(payload.SID) == "" {
 		return ""
 	}
-	if strings.TrimSpace(payload.FTR) == "" && strings.TrimSpace(payload.BFP) == "" {
+	if strings.TrimSpace(payload.FTR) == "" && strings.TrimSpace(payload.BFP) == "" && strings.TrimSpace(payload.ARK) == "" {
 		return ""
 	}
 	return value
