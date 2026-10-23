@@ -198,26 +198,6 @@ async function extractAdobeCookie(params) {
       if (check.result?.value) break;
     }
 
-    await new Promise(r => setTimeout(r, 2000));
-    await send('Runtime.evaluate', {
-      expression: `(() => {
-        const el = document.querySelector('#EmailPage-EmailField');
-        if (el) {
-          el.focus();
-          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-          setter.call(el, '');
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-      })()`
-    });
-    await send('Input.insertText', { text: email });
-    await new Promise(r => setTimeout(r, 1000));
-    await send('Runtime.evaluate', {
-      expression: `document.querySelector('[data-id=EmailPage-ContinueButton]')?.click()`
-    });
-
-    await new Promise(r => setTimeout(r, 7000));
-
     // 如果提供了微软邮箱令牌且未填密码（或优先使用一次性验证码），自动点一次性验证码登录
     let submittedAuth = false;
     for (let step = 0; step < 45; step++) {
@@ -226,6 +206,7 @@ async function extractAdobeCookie(params) {
         expression: `JSON.stringify({
           url: location.href,
           text: document.body ? document.body.innerText.slice(0, 300) : '',
+          hasEmail: Boolean(document.querySelector('#EmailPage-EmailField')),
           hasPwd: Boolean(document.querySelector('#PasswordPage-PasswordField')),
           hasUsePwdBtn: Array.from(document.querySelectorAll('button, a')).some(b => /sign in with your password|continue with password|use password|密码/i.test(b.innerText || b.textContent || '')),
           hasOtpBtn: Array.from(document.querySelectorAll('button, a')).some(b => /one-time code|sign in with a code|send.*verification code|验证码/i.test(b.innerText || b.textContent || '')) || (/send you a verification code|验证码发送到/i.test(document.body ? document.body.innerText : '') && !document.querySelectorAll('[data-id^=CodeInput-], input[inputmode=numeric]').length),
@@ -236,10 +217,30 @@ async function extractAdobeCookie(params) {
         returnByValue: true
       });
       const st = JSON.parse(stateRes.result.value);
-      if (step < 5) console.log('Step', step, st.url.slice(0, 70), 'hasPwd:', st.hasPwd, 'hasOtpBtn:', st.hasOtpBtn, 'text:', st.text.replace(/\s+/g, ' ').slice(0, 120));
+      if (step < 5) console.log('Step', step, st.url.slice(0, 70), 'hasEmail:', st.hasEmail, 'hasPwd:', st.hasPwd, 'hasOtpBtn:', st.hasOtpBtn);
 
       if (submittedAuth && st.isAccountHome) {
         break;
+      }
+
+      if (st.hasEmail) {
+        log(`正在填入邮箱 ${email} 并点击继续...`);
+        await send('Runtime.evaluate', {
+          expression: `(() => {
+            const el = document.querySelector('#EmailPage-EmailField');
+            if (!el) return;
+            el.focus();
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            setter.call(el, ${JSON.stringify(email)});
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            setTimeout(() => {
+              document.querySelector('[data-id=EmailPage-ContinueButton], button[type=submit]')?.click();
+            }, 300);
+          })()`
+        });
+        await new Promise(r => setTimeout(r, 4500));
+        continue;
       }
 
       if (st.hasSkipPhone) {
@@ -275,17 +276,16 @@ async function extractAdobeCookie(params) {
             if (el) {
               el.focus();
               const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-              setter.call(el, '');
+              setter.call(el, ${JSON.stringify(adobePassword)});
               el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
             }
             const remember = document.querySelector('input[type=checkbox]');
             if (remember && !remember.checked) remember.click();
+            setTimeout(() => {
+              document.querySelector('[data-id=PasswordPage-ContinueButton], button[type=submit]')?.click();
+            }, 300);
           })()`
-        });
-        await send('Input.insertText', { text: adobePassword });
-        await new Promise(r => setTimeout(r, 600));
-        await send('Runtime.evaluate', {
-          expression: `document.querySelector('[data-id=PasswordPage-ContinueButton]')?.click()`
         });
         submittedAuth = true;
         await new Promise(r => setTimeout(r, 5000));
@@ -319,15 +319,21 @@ async function extractAdobeCookie(params) {
         }
         if (!code) throw new Error('等待 Outlook 验证码邮件超时');
         log(`已自动收到验证码 ${code}，正在填入...`);
+        await send('Page.bringToFront');
         for (let d = 0; d < 6; d++) {
           await send('Runtime.evaluate', {
             expression: `(() => {
               const boxes = document.querySelectorAll('[data-id^=CodeInput-], input[inputmode=numeric]');
               const box = boxes[${d}] || boxes[0];
-              if (box) box.focus();
+              if (box) {
+                box.focus();
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                if (setter) setter.call(box, ${JSON.stringify(code[d])});
+                box.dispatchEvent(new Event('input', { bubbles: true }));
+                box.dispatchEvent(new Event('change', { bubbles: true }));
+              }
             })()`
           });
-          await send('Input.insertText', { text: code[d] });
           await new Promise(res => setTimeout(res, 150));
         }
         await new Promise(res => setTimeout(res, 1500));
