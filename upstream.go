@@ -387,14 +387,20 @@ func (g *AdobeGenerator) uploadReference(ctx context.Context, client *http.Clien
 		Images []struct {
 			ID string `json:"id"`
 		} `json:"images"`
-		ErrorCode string `json:"error_code"`
-		Message   string `json:"message"`
+		ErrorCode json.RawMessage `json:"error_code"`
+		Message   string          `json:"message"`
 	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&payload); err != nil {
-		return "", errors.New("参考图上传响应无效")
-	}
+	decodeErr := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&payload)
+	errCode := strings.Trim(strings.TrimSpace(string(payload.ErrorCode)), "\"")
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", adobeUpstreamError(response, response.StatusCode, payload.ErrorCode, payload.Message)
+		message := payload.Message
+		if message == "" || len(message) > 1024 {
+			message = http.StatusText(response.StatusCode)
+		}
+		return "", adobeUpstreamError(response, response.StatusCode, errCode, message)
+	}
+	if decodeErr != nil {
+		return "", errors.New("参考图上传响应无效")
 	}
 	if len(payload.Images) == 0 || payload.Images[0].ID == "" {
 		return "", errors.New("上游未返回参考图标识")

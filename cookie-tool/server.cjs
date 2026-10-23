@@ -100,7 +100,7 @@ async function extractAdobeCookie(params) {
   };
   const parsed = parseAccountLine(params.accountLine) || {};
   const email = (params.email || parsed.email || '').trim();
-  const adobePassword = (params.adobePassword || parsed.adobePassword || '').trim();
+  const adobePassword = (params.adobePassword || parsed.adobePassword || parsed.emailPassword || '').trim();
   const mailClientId = (params.mailClientId || parsed.mailClientId || '').trim();
   const mailRefreshToken = (params.mailRefreshToken || parsed.mailRefreshToken || '').trim();
   const note = (params.note || parsed.note || '').trim();
@@ -228,7 +228,7 @@ async function extractAdobeCookie(params) {
           text: document.body ? document.body.innerText.slice(0, 300) : '',
           hasPwd: Boolean(document.querySelector('#PasswordPage-PasswordField')),
           hasUsePwdBtn: Array.from(document.querySelectorAll('button, a')).some(b => /sign in with your password|continue with password|use password|密码/i.test(b.innerText || b.textContent || '')),
-          hasOtpBtn: Array.from(document.querySelectorAll('button, a')).some(b => /one-time code|sign in with a code|send.*verification code|验证码/i.test(b.innerText || b.textContent || '')),
+          hasOtpBtn: Array.from(document.querySelectorAll('button, a')).some(b => /one-time code|sign in with a code|send.*verification code|验证码/i.test(b.innerText || b.textContent || '')) || (/send you a verification code|验证码发送到/i.test(document.body ? document.body.innerText : '') && !document.querySelectorAll('[data-id^=CodeInput-], input[inputmode=numeric]').length),
           hasCodeBoxes: document.querySelectorAll('[data-id^=CodeInput-], input[inputmode=numeric]').length > 0,
           hasSkipPhone: location.hash.includes('add-security-phone-number') || Boolean(document.querySelector('[data-id=PP-AddSecurityPhoneNumber-skip-btn]')) || /mobile phone number|Not now/i.test(document.body ? document.body.innerText : ''),
           isAccountHome: location.hostname === 'firefly.adobe.com'
@@ -293,12 +293,12 @@ async function extractAdobeCookie(params) {
       }
 
       if (st.hasOtpBtn && !st.hasCodeBoxes && mailClientId && mailRefreshToken) {
-        log('正在点击「邮箱一次性验证码登录」并从 Outlook 自动收取验证码...');
+        log('正在点击发送邮箱验证码并从 Outlook 自动收取验证码...');
         await send('Runtime.evaluate', {
           expression: `(() => {
             const remember = document.querySelector('input[type=checkbox]');
             if (remember && !remember.checked) remember.click();
-            const otpBtn = Array.from(document.querySelectorAll('button, a')).find(b => /one-time code|sign in with a code|验证码/i.test(b.innerText));
+            const otpBtn = Array.from(document.querySelectorAll('button, a')).find(b => /one-time code|sign in with a code|continue|继续|验证码/i.test((b.innerText || b.textContent || '').trim()));
             if (otpBtn) otpBtn.click();
           })()`
         });
@@ -332,10 +332,14 @@ async function extractAdobeCookie(params) {
         }
         await new Promise(res => setTimeout(res, 1500));
         await send('Runtime.evaluate', {
-          expression: `document.querySelector('button[type=submit], [data-id*=Continue]')?.click()`
+          expression: `(() => {
+            if (document.querySelectorAll('[data-id^=CodeInput-], input[inputmode=numeric]').length > 0) {
+              document.querySelector('button[type=submit], [data-id*=Continue]')?.click();
+            }
+          })()`
         });
         submittedAuth = true;
-        await new Promise(res => setTimeout(res, 5000));
+        await new Promise(res => setTimeout(res, 3500));
       }
     }
 

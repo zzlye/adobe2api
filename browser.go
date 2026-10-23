@@ -64,6 +64,9 @@ const browserSessionScript = `(async () => {
   });
   const check = () => {
    const now=Date.now();
+   const acceptBtn=typeof document!=='undefined'&&document.querySelector?document.querySelector('#onetrust-accept-btn-handler'):null;
+   if(typeof acceptBtn?.click==='function')acceptBtn.click();
+   if(typeof window!=='undefined'&&typeof window.OneTrust?.AllowAll==='function')try{window.OneTrust.AllowAll()}catch{}
    if(now>deadline)return finish(new Error('Adobe 风险会话尚未完成初始化，请打开已登录的 Adobe 生图页面后重新同步'));
    if(latest&&firstAt&&now-firstAt>=20000&&now-changedAt>=1500&&validArp(latest))return finish();
    timer=setTimeout(check,250);
@@ -203,8 +206,17 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 			return account, fmt.Errorf("启动续期浏览器失败: %w", err)
 		}
 		request := &http.Request{Header: http.Header{"Cookie": []string{account.Cookie}}}
-		// 原始 Cookie 文本没有域信息，将 Adobe SSO Cookie 写入其实际认证域。
+		skipConsent := map[string]bool{
+			"OptanonConsent":                                 true,
+			"OptanonAlertBoxClosed":                          true,
+			"kndctr_9E1005A551ED61CA0A490D45_AdobeOrg_consent": true,
+			"edge_geo_country":                               true,
+		}
+		// 原始 Cookie 文本没有域信息，将 Adobe SSO Cookie 写入其实际认证域（过滤隐私拦截 Cookie 以免阻止风险组件加载）。
 		for _, cookie := range request.Cookies() {
+			if skipConsent[cookie.Name] {
+				continue
+			}
 			for _, domain := range []string{".adobe.com", ".services.adobe.com", ".adobelogin.com"} {
 				secure := true
 				_, err := chromedp.Call(browserCtx, network.SetCookie, network.SetCookieParams{Name: cookie.Name, Value: cookie.Value, Domain: domain, Path: "/", Secure: &secure})
