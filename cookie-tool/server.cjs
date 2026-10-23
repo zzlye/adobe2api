@@ -425,7 +425,7 @@ async function extractAdobeCookie(params) {
           const jwtPayload = JSON.parse(Buffer.from(capturedToken.split('.')[1], 'base64url').toString('utf8'));
           const userId = jwtPayload.user_id || jwtPayload.sub || '';
           session = { token: capturedToken, arp: sherlock, profile: { userId, email } };
-          if (decoded && decoded.ftr && !decoded.ftr.includes('___') && !decoded.ftr.endsWith('__tt')) {
+          if (decoded && decoded.ftr && decoded.ark && decoded.bfp && !decoded.ftr.includes('___') && !decoded.ftr.endsWith('__tt')) {
             break;
           }
         } catch {}
