@@ -206,15 +206,24 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 			return account, fmt.Errorf("启动续期浏览器失败: %w", err)
 		}
 		request := &http.Request{Header: http.Header{"Cookie": []string{account.Cookie}}}
-		skipConsent := map[string]bool{
+		skipCookies := map[string]bool{
 			"OptanonConsent":                                 true,
 			"OptanonAlertBoxClosed":                          true,
 			"kndctr_9E1005A551ED61CA0A490D45_AdobeOrg_consent": true,
 			"edge_geo_country":                               true,
+			"sherlockToken":                                  true,
+			"forter":                                         true,
+			"forterToken":                                    true,
+			"ftrset":                                         true,
+			"ftr_ncd":                                        true,
+			"ftr_blst_1h":                                    true,
+			"arkose":                                         true,
+			"bfp":                                            true,
+			"ff_session_guid":                                true,
 		}
-		// 原始 Cookie 文本没有域信息，将 Adobe SSO Cookie 写入其实际认证域（过滤隐私拦截 Cookie 以免阻止风险组件加载）。
+		// 原始 Cookie 文本没有域信息，将 Adobe SSO Cookie 写入其实际认证域（过滤隐私拦截与过期风险 Cookie 以生成全新风险凭据）。
 		for _, cookie := range request.Cookies() {
-			if skipConsent[cookie.Name] {
+			if skipCookies[cookie.Name] {
 				continue
 			}
 			for _, domain := range []string{".adobe.com", ".services.adobe.com", ".adobelogin.com"} {
@@ -225,8 +234,12 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 				}
 			}
 		}
+		targetURL := "https://firefly.adobe.com/generate/image"
+		if account.AccessToken != "" {
+			targetURL = "https://firefly.adobe.com/generate/image#access_token=" + url.QueryEscape(account.AccessToken) + "&token_type=bearer&expires_in=86400000"
+		}
 		// 直接发送导航，不等待广告和统计资源结束；登录服务由下方脚本自行等待。
-		navigation, err := chromedp.Call(browserCtx, page.Navigate, page.NavigateParams{URL: "https://firefly.adobe.com/generate/image"})
+		navigation, err := chromedp.Call(browserCtx, page.Navigate, page.NavigateParams{URL: targetURL})
 		if err != nil {
 			return account, fmt.Errorf("打开 Adobe 续期页面失败: %w", err)
 		}
