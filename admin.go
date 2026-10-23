@@ -445,7 +445,7 @@ func (a *App) adminUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	a.poolMu.Lock()
 	defer a.poolMu.Unlock()
-	if a.busy[r.PathValue("id")] && (patch.Name != nil || patch.Enabled != nil || strings.TrimSpace(patch.Cookie) != "") {
+	if a.busy[r.PathValue("id")] && (patch.Name != nil || strings.TrimSpace(patch.Cookie) != "") {
 		writeError(w, http.StatusConflict, "账号正在使用，请稍后修改")
 		return
 	}
@@ -858,6 +858,9 @@ func (a *App) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	updated.ID, updated.LastRefresh, updated.RequestsPerMinute = account.ID, time.Now().UTC(), account.RequestsPerMinute
+	if current, findErr := a.findAdminAccount(account.ID); findErr == nil {
+		updated.Name, updated.Enabled, updated.RequestsPerMinute = current.Name, current.Enabled, current.RequestsPerMinute
+	}
 	updated.LastError, updated.Status = "", "unverified"
 	if err := a.store.SaveAccount(updated); err != nil {
 		writeError(w, http.StatusInternalServerError, "保存刷新结果失败")

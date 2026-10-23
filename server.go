@@ -160,6 +160,10 @@ func (a *App) accountAvailableLocked(account Account, now time.Time) bool {
 	if a.busy[account.ID] && inFlight == 0 {
 		return false
 	}
+	needsRefresh := account.AccessToken == "" || account.UserID == "" || account.Status == "pending" || account.Status == "expired" || (!account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) < time.Minute)
+	if needsRefresh && (a.busy[account.ID] || inFlight > 0) {
+		return false
+	}
 	history := a.requestHistory[account.ID]
 	valid := history[:0]
 	for _, ts := range history {
@@ -367,8 +371,14 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 	}
 	defer release()
 	saveAccountState := func(acc Account) error {
+		a.poolMu.Lock()
+		defer a.poolMu.Unlock()
 		if current, findErr := a.findAdminAccount(acc.ID); findErr == nil {
 			acc.Name, acc.Enabled, acc.RequestsPerMinute = current.Name, current.Enabled, current.RequestsPerMinute
+			if current.LastRefresh.After(acc.LastRefresh) {
+				acc.Cookie, acc.AccessToken, acc.RefreshToken, acc.ARPSession = current.Cookie, current.AccessToken, current.RefreshToken, current.ARPSession
+				acc.ExpiresAt, acc.LastRefresh = current.ExpiresAt, current.LastRefresh
+			}
 		}
 		return a.store.SaveAccount(acc)
 	}

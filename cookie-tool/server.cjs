@@ -200,6 +200,7 @@ async function extractAdobeCookie(params) {
 
     // 如果提供了微软邮箱令牌且未填密码（或优先使用一次性验证码），自动点一次性验证码登录
     let submittedAuth = false;
+    let capturedToken = '';
     for (let step = 0; step < 45; step++) {
       await new Promise(r => setTimeout(r, 1500));
       const stateRes = await send('Runtime.evaluate', {
@@ -217,6 +218,10 @@ async function extractAdobeCookie(params) {
         returnByValue: true
       });
       const st = JSON.parse(stateRes.result.value);
+      if (st.url && st.url.includes('access_token=')) {
+        const m = st.url.match(/access_token=([^&]+)/);
+        if (m) capturedToken = decodeURIComponent(m[1]);
+      }
       if (step < 5) console.log('Step', step, st.url.slice(0, 70), 'hasEmail:', st.hasEmail, 'hasPwd:', st.hasPwd, 'hasOtpBtn:', st.hasOtpBtn);
 
       if (submittedAuth && st.isAccountHome) {
@@ -325,15 +330,10 @@ async function extractAdobeCookie(params) {
             expression: `(() => {
               const boxes = document.querySelectorAll('[data-id^=CodeInput-], input[inputmode=numeric]');
               const box = boxes[${d}] || boxes[0];
-              if (box) {
-                box.focus();
-                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-                if (setter) setter.call(box, ${JSON.stringify(code[d])});
-                box.dispatchEvent(new Event('input', { bubbles: true }));
-                box.dispatchEvent(new Event('change', { bubbles: true }));
-              }
+              if (box) box.focus();
             })()`
           });
+          await send('Input.insertText', { text: code[d] });
           await new Promise(res => setTimeout(res, 150));
         }
         await new Promise(res => setTimeout(res, 1500));
@@ -361,26 +361,51 @@ async function extractAdobeCookie(params) {
     await send('Network.deleteCookies', { name: 'OptanonConsent', domain: '.adobe.com' });
     await send('Network.deleteCookies', { name: 'OptanonAlertBoxClosed', domain: '.adobe.com' });
     await send('Network.deleteCookies', { name: 'kndctr_9E1005A551ED61CA0A490D45_AdobeOrg_consent', domain: '.adobe.com' });
-    await send('Page.reload');
+    if (capturedToken) {
+      await send('Page.navigate', {
+        url: `https://firefly.adobe.com/generate/image#access_token=${encodeURIComponent(capturedToken)}&token_type=bearer&expires_in=86400000`
+      });
+    } else {
+      await send('Page.reload');
+    }
 
-    let capturedToken = '';
     let session = null;
     for (let i = 0; i < 30; i++) {
       await new Promise(r => setTimeout(r, 2000));
       const check = await send('Runtime.evaluate', {
-        expression: `(() => {
+        expression: `(async () => {
           const acceptBtn = document.querySelector('#onetrust-accept-btn-handler');
           if (acceptBtn) acceptBtn.click();
           if (window.OneTrust && typeof window.OneTrust.AllowAll === 'function') {
             try { window.OneTrust.AllowAll(); } catch {}
           }
           const imsTok = window.adobeIMS && window.adobeIMS.getAccessToken && window.adobeIMS.getAccessToken();
+          let fiberTok = '', fiberArp = '';
+          const el = document.querySelector('firefly-image-generation');
+          if (el) {
+            const key = Object.keys(el).find(k => k.startsWith('__reactFiber'));
+            let fiber = el[key];
+            for (let j = 0; fiber && j < 15; j++, fiber = fiber.return) {
+              const auth = fiber.memoizedProps?.service?.host?.authentication;
+              if (auth) {
+                const read = s => new Promise(resolve => {
+                  let d, done = false;
+                  const t = setTimeout(() => { if (!done) { done = true; resolve(''); } }, 1200);
+                  d = s(v => { if (!done) { done = true; clearTimeout(t); if (typeof d === 'function') d(); resolve(v || ''); } });
+                });
+                [fiberTok, fiberArp] = await Promise.all([read(auth.accessToken), read(auth.arpSessionToken)]);
+                break;
+              }
+            }
+          }
           return JSON.stringify({
             url: location.href,
-            hasEl: Boolean(document.querySelector('firefly-image-generation')),
-            token: imsTok && imsTok.token
+            hasEl: Boolean(el),
+            token: (imsTok && imsTok.token) || fiberTok || '',
+            arp: fiberArp || ''
           });
         })()`,
+        awaitPromise: true,
         returnByValue: true
       });
       const st = check.result?.value ? JSON.parse(check.result.value) : {};
@@ -393,7 +418,7 @@ async function extractAdobeCookie(params) {
         if (m) capturedToken = decodeURIComponent(m[1]);
       }
       const cookiesRes = await send('Network.getAllCookies');
-      const sherlock = (cookiesRes.cookies || []).find(c => c.name === 'sherlockToken')?.value;
+      const sherlock = st.arp || (cookiesRes.cookies || []).find(c => c.name === 'sherlockToken')?.value;
       if (sherlock && capturedToken) {
         try {
           const decoded = JSON.parse(Buffer.from(sherlock, 'base64').toString('utf8'));
