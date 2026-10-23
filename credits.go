@@ -175,8 +175,8 @@ func inputRequiresPremiumForFree(input GenerateInput) bool {
 			return true
 		}
 	}
-	// GPT Image 2.5 在 high / max 画质（detailLevel > 3）下仅 Premium 套餐免积分。
-	if strings.HasPrefix(input.Model, "gpt-image-2.5") {
+	// GPT Image 全系列（含 gpt-image-2 与 gpt-image-2.5）在 high / max 画质（detailLevel > 3）下仅 Premium 套餐免积分。
+	if strings.HasPrefix(input.Model, "gpt-image") {
 		if input.Quality == "high" || input.Quality == "max" {
 			return true
 		}

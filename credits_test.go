@@ -244,6 +244,7 @@ func TestAccountPlanInferenceAndSchedulingStrategy(t *testing.T) {
 		{Model: "gpt-image-2.5-sunburst", Resolution: "4K"},
 		{Model: "gpt-image-2.5-sunburst", Resolution: "2K", AspectRatio: "21:9", Size: "3024x1296"},
 		{Model: "gpt-image-2.5-flare", Resolution: "1K", Quality: "high"},
+		{Model: "gpt-image-2", Resolution: "2K", Quality: "high"},
 	} {
 		if _, _, err := app.reserveAccountForInput(item); !errors.Is(err, errRateLimited) {
 			t.Fatalf("不用积分模式下 %+v 在 Premium 限流时应返回 429 限流，实际: %v", item, err)
