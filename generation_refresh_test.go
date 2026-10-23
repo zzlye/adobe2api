@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 从正式兼容路由调用真实 Adobe 刷新适配器，失败也必须保留完整的 IMS 上游记录。
@@ -107,3 +110,27 @@ func TestExplicitUpstreamLogOverridesContextWithoutDuplicate(t *testing.T) {
 		t.Fatal("显式日志和上下文日志重复保存同一个上游请求")
 	}
 }
+
+func TestARPSessionExpiryAndAutoRetryOn408(t *testing.T) {
+	now := time.UnixMilli(1792778000000)
+	makeARP := func(ftr string, withAll bool) string {
+		payload := map[string]string{"sid": "sid-1", "ftr": ftr}
+		if withAll {
+			payload["ark"] = "ark-token"
+			payload["bfp"] = "bfp-token"
+		}
+		raw, _ := json.Marshal(payload)
+		return base64.StdEncoding.EncodeToString(raw)
+	}
+	freshARP := makeARP("cd966c780c114ed18f037acd8525af53_"+strconv.FormatInt(now.Add(-2*time.Hour).UnixMilli(), 10)+"__UDFT5_31ck_tt", true)
+	expiredARP := makeARP("cd966c780c114ed18f037acd8525af53_"+strconv.FormatInt(now.Add(-5*time.Hour).UnixMilli(), 10)+"__UDFT5_31ck_tt", true)
+	incompleteARP := makeARP("cd966c780c114ed18f037acd8525af53_"+strconv.FormatInt(now.UnixMilli(), 10)+"__UDFT5_31ck_tt", false)
+	udf9ARP := makeARP("cd966c780c114ed18f037acd8525af53_"+strconv.FormatInt(now.UnixMilli(), 10)+"__UDF9_13ck_tt", true)
+	if arpSessionExpired(freshARP, now) {
+		t.Fatal("未满 4 小时的完整风险会话被误判为过期")
+	}
+	if !arpSessionExpired(expiredARP, now) || !arpSessionExpired(incompleteARP, now) || !arpSessionExpired(udf9ARP, now) {
+		t.Fatal("已超时、缺字段或降级为 UDF9 的风险会话未被识别为需要刷新")
+	}
+}
+

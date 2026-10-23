@@ -844,7 +844,11 @@ func (a *App) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), accountRefreshTimeout)
 	defer cancel()
-	updated, err := a.generator.Refresh(ctx, account)
+	refreshBase := account
+	if refreshBase.Status == "error" && (strings.Contains(refreshBase.LastError, "408") || strings.Contains(refreshBase.LastError, "system under load")) {
+		refreshBase.ARPSession = ""
+	}
+	updated, err := a.generator.Refresh(ctx, refreshBase)
 	if err != nil {
 		account = mergeConfirmedRefresh(account, updated)
 		account.Status, account.LastError = "expired", safeError(err)

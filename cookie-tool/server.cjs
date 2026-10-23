@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const tls = require('tls');
 const { spawn, execSync } = require('child_process');
 
 const PORT = Number(process.env.COOKIE_TOOL_PORT || 18899);
@@ -51,8 +52,8 @@ function parseAccountLine(raw) {
   return null;
 }
 
-// 通过微软 Graph API 读取最新一封邮件的 ID 与 6 位 Adobe 验证码
-async function fetchLatestOutlookCode(clientId, refreshToken) {
+// 通过微软 Graph API 或 IMAP XOAUTH2 读取最新一封邮件的 ID 与 6 位 Adobe 验证码
+async function fetchLatestOutlookCode(clientId, refreshToken, emailAddr = '') {
   if (!clientId || !refreshToken) return { id: '', code: null };
   try {
     const tokenRes = await fetch('https://login.microsoftonline.com/common/oauth2/v2.0/token', {
@@ -66,27 +67,79 @@ async function fetchLatestOutlookCode(clientId, refreshToken) {
       })
     });
     const tokenData = await tokenRes.json();
-    if (!tokenData.access_token) return { id: '', code: null };
-
-    const mailRes = await fetch(
-      'https://graph.microsoft.com/v1.0/me/messages?$top=3&$select=id,subject,receivedDateTime,bodyPreview,body',
-      { headers: { Authorization: `Bearer ${tokenData.access_token}` } }
-    );
-    const mailData = await mailRes.json();
-    const messages = Array.isArray(mailData.value) ? mailData.value : [];
-    for (const msg of messages) {
-      const rawHtml = (msg.body && msg.body.content) || '';
-      const plain = rawHtml
-        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/&nbsp;|&#\d+;|[\u200B-\u200D\uFEFF]/g, ' ')
-        .replace(/\s+/g, ' ');
-      const text = `${msg.subject || ''} ${msg.bodyPreview || ''} ${plain}`;
-      if (!/adobe|authentication code|verification code|验证码/i.test(text)) continue;
-      const match = plain.match(/\b(\d{6})\b/) || text.match(/\b(\d{6})\b/);
-      if (match) return { id: msg.id, code: match[1] };
+    if (tokenData.access_token) {
+      const mailRes = await fetch(
+        'https://graph.microsoft.com/v1.0/me/messages?$top=3&$select=id,subject,receivedDateTime,bodyPreview,body',
+        { headers: { Authorization: `Bearer ${tokenData.access_token}` } }
+      );
+      const mailData = await mailRes.json();
+      const messages = Array.isArray(mailData.value) ? mailData.value : [];
+      for (const msg of messages) {
+        const rawHtml = (msg.body && msg.body.content) || '';
+        const plain = rawHtml
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;|&#\d+;|[\u200B-\u200D\uFEFF]/g, ' ')
+          .replace(/\s+/g, ' ');
+        const text = `${msg.subject || ''} ${msg.bodyPreview || ''} ${plain}`;
+        if (!/adobe|authentication code|verification code|验证码/i.test(text)) continue;
+        const match = plain.match(/\b(\d{6})\b/) || text.match(/\b(\d{6})\b/);
+        if (match) return { id: msg.id, code: match[1] };
+      }
     }
   } catch {}
+  if (emailAddr) {
+    try {
+      const imapRes = await fetch('https://login.microsoftonline.com/consumers/oauth2/v2.0/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: clientId,
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+          scope: 'https://outlook.office.com/IMAP.AccessAsUser.All offline_access'
+        })
+      });
+      const imapData = await imapRes.json();
+      if (imapData.access_token) {
+        const xoauth2 = Buffer.from(`user=${emailAddr}\x01auth=Bearer ${imapData.access_token}\x01\x01`).toString('base64');
+        return await new Promise(resolve => {
+          const sock = tls.connect(993, 'outlook.office365.com', { servername: 'outlook.office365.com' });
+          let buf = '', step = 0, lastSeq = '';
+          const timer = setTimeout(() => { try { sock.destroy(); } catch {} resolve({ id: '', code: null }); }, 12000);
+          sock.setEncoding('utf8');
+          sock.on('data', chunk => {
+            buf += chunk;
+            if (step === 0 && buf.includes('OK')) {
+              step = 1; buf = '';
+              sock.write(`A1 AUTHENTICATE XOAUTH2 ${xoauth2}\r\n`);
+            } else if (step === 1 && buf.includes('A1 OK')) {
+              step = 2; buf = '';
+              sock.write('A2 SELECT INBOX\r\n');
+            } else if (step === 2 && buf.includes('A2 OK')) {
+              const m = buf.match(/\*\s+(\d+)\s+EXISTS/i);
+              lastSeq = m ? m[1] : '1';
+              step = 3; buf = '';
+              sock.write(`A3 FETCH ${lastSeq} (UID BODY.PEEK[HEADER.FIELDS (SUBJECT)] BODY.PEEK[TEXT])\r\n`);
+            } else if (step === 3 && buf.includes('A3 OK')) {
+              step = 4; clearTimeout(timer);
+              const uidMatch = buf.match(/UID\s+(\d+)/i);
+              const uid = uidMatch ? uidMatch[1] : lastSeq;
+              let text = buf.replace(/=\r?\n/g, '').replace(/=3D/g, '=');
+              for (const b64 of buf.match(/(?:[A-Za-z0-9+/]{40,}\r?\n)+[A-Za-z0-9+/=]{10,}/g) || []) {
+                try { text += '\n' + Buffer.from(b64.replace(/\s+/g, ''), 'base64').toString('utf8'); } catch {}
+              }
+              const clean = text.replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/#[0-9a-fA-F]{6}/g, ' ');
+              const mCode = clean.match(/(?:verification code is|code is|:\s*)\s*(\d{6})/i) || clean.match(/(?<!\d)(\d{6})(?!\d)/);
+              sock.end('A4 LOGOUT\r\n');
+              resolve({ id: uid, code: mCode ? mCode[1] : null });
+            }
+          });
+          sock.on('error', () => { clearTimeout(timer); resolve({ id: '', code: null }); });
+        });
+      }
+    } catch {}
+  }
   return { id: '', code: null };
 }
 
@@ -118,7 +171,7 @@ async function extractAdobeCookie(params) {
   const browserPath = findBrowserPath();
 
   log('正在读取邮箱初始状态并启动独立浏览器...');
-  const beforeMail = await fetchLatestOutlookCode(mailClientId, mailRefreshToken);
+  const beforeMail = await fetchLatestOutlookCode(mailClientId, mailRefreshToken, email);
 
   const loginUrl =
     'https://ims-na1.adobelogin.com/ims/authorize/v2?client_id=clio-playground-web&scope=AdobeID%2Cfirefly_api%2Copenid%2Cpps.read%2Cpps.write%2Cadditional_info.projectedProductContext%2Cadditional_info.ownerOrg%2Cuds_read%2Cuds_write%2Cab.manage%2Cread_organizations%2Cadditional_info.roles%2Caccount_cluster.read%2Ccreative_production%2Ctk_platform%2Ctk_platform_sync%2Caf_byof%2Cprofile%2Cdii_lr_ml_unlimited&redirect_uri=https%3A%2F%2Ffirefly.adobe.com%2Fgenerate%2Fimage&response_type=token&state=%7B%22ac%22%3A%22firefly.adobe.com%22%7D&locale=en_US';
@@ -209,7 +262,7 @@ async function extractAdobeCookie(params) {
           text: document.body ? document.body.innerText.slice(0, 300) : '',
           hasEmail: Boolean(document.querySelector('#EmailPage-EmailField')),
           hasPwd: Boolean(document.querySelector('#PasswordPage-PasswordField')),
-          hasUsePwdBtn: Array.from(document.querySelectorAll('button, a')).some(b => /sign in with your password|continue with password|use password|密码/i.test(b.innerText || b.textContent || '')),
+          hasUsePwdBtn: Array.from(document.querySelectorAll('button, a')).some(b => /sign in with your password|continue with password|use\s+(?:your\s+)?password|password instead|密码/i.test(b.innerText || b.textContent || '')),
           hasOtpBtn: Array.from(document.querySelectorAll('button, a')).some(b => /one-time code|sign in with a code|send.*verification code|验证码/i.test(b.innerText || b.textContent || '')) || (/send you a verification code|验证码发送到/i.test(document.body ? document.body.innerText : '') && !document.querySelectorAll('[data-id^=CodeInput-], input[inputmode=numeric]').length),
           hasCodeBoxes: document.querySelectorAll('[data-id^=CodeInput-], input[inputmode=numeric]').length > 0,
           hasSkipPhone: location.hash.includes('add-security-phone-number') || Boolean(document.querySelector('[data-id=PP-AddSecurityPhoneNumber-skip-btn]')) || /mobile phone number|Not now/i.test(document.body ? document.body.innerText : ''),
@@ -265,7 +318,7 @@ async function extractAdobeCookie(params) {
         log('正在切换至密码登录...');
         await send('Runtime.evaluate', {
           expression: `(() => {
-            const btn = Array.from(document.querySelectorAll('button, a')).find(b => /sign in with your password|continue with password|use password|密码/i.test(b.innerText || b.textContent || ''));
+            const btn = Array.from(document.querySelectorAll('button, a')).find(b => /sign in with your password|continue with password|use\s+(?:your\s+)?password|password instead|密码/i.test(b.innerText || b.textContent || ''));
             if (btn) btn.click();
           })()`
         });
@@ -316,7 +369,7 @@ async function extractAdobeCookie(params) {
         let code = null;
         for (let r = 0; r < 18; r++) {
           await new Promise(res => setTimeout(res, 2500));
-          const cur = await fetchLatestOutlookCode(mailClientId, mailRefreshToken);
+          const cur = await fetchLatestOutlookCode(mailClientId, mailRefreshToken, email);
           if (cur.id && cur.id !== beforeMail.id && cur.code) {
             code = cur.code;
             break;

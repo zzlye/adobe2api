@@ -162,7 +162,16 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 		}
 		defer os.RemoveAll(profile)
 		options := append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
-		options = append(options, chromedp.UserDataDir(profile), chromedp.Flag("disable-dev-shm-usage", true), chromedp.Flag("disk-cache-size", "8388608"), chromedp.Flag("media-cache-size", "1048576"), chromedp.Flag("disable-gpu", true))
+		options = append(options,
+			chromedp.UserDataDir(profile),
+			chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"),
+			chromedp.WindowSize(1920, 1080),
+			chromedp.Flag("disable-blink-features", "AutomationControlled"),
+			chromedp.Flag("disable-dev-shm-usage", true),
+			chromedp.Flag("disk-cache-size", "8388608"),
+			chromedp.Flag("media-cache-size", "1048576"),
+			chromedp.Flag("disable-gpu", true),
+		)
 		if path := os.Getenv("ADOBE2API_CHROME"); path != "" {
 			options = append(options, chromedp.ExecPath(path))
 		}
@@ -234,12 +243,8 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 				}
 			}
 		}
-		targetURL := "https://firefly.adobe.com/generate/image"
-		if account.AccessToken != "" {
-			targetURL = "https://firefly.adobe.com/generate/image#access_token=" + url.QueryEscape(account.AccessToken) + "&token_type=bearer&expires_in=86400000"
-		}
 		// 直接发送导航，不等待广告和统计资源结束；登录服务由下方脚本自行等待。
-		navigation, err := chromedp.Call(browserCtx, page.Navigate, page.NavigateParams{URL: targetURL})
+		navigation, err := chromedp.Call(browserCtx, page.Navigate, page.NavigateParams{URL: "https://firefly.adobe.com/generate/image"})
 		if err != nil {
 			return account, fmt.Errorf("打开 Adobe 续期页面失败: %w", err)
 		}

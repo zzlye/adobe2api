@@ -882,7 +882,7 @@ func (g *AdobeGenerator) Refresh(ctx context.Context, account Account) (updated 
 		}
 	}()
 	updated, err = g.refreshIMS(ctx, account)
-	if err == nil && updated.ARPSession != "" {
+	if err == nil && !arpSessionExpired(updated.ARPSession, time.Now()) {
 		return updated, nil
 	}
 	if ctx.Err() != nil {
@@ -997,7 +997,9 @@ func (g *AdobeGenerator) refreshIMS(ctx context.Context, account Account) (Accou
 	}
 	account.Cookie = mergeAdobeCookies(account.Cookie, response.Cookies())
 	if account.ARPSession == "" {
-		account.ARPSession = cookieARPSession(account.Cookie)
+		if candidate := cookieARPSession(account.Cookie); !arpSessionExpired(candidate, time.Now()) {
+			account.ARPSession = candidate
+		}
 	}
 	account.AccessToken, account.UserID = token, refreshedUserID
 	if payload.RefreshToken != "" {
@@ -1045,6 +1047,48 @@ func mergeAdobeCookies(raw string, incoming []*http.Cookie) string {
 		}
 	}
 	return strings.Join(pairs, "; ")
+}
+
+// arpSessionExpired 判断风险会话是否缺失、未完成四项供应商采集或已超过 4 小时有效期（避免满 7 小时后触发上游 408）。
+func arpSessionExpired(raw string, now time.Time) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return true
+	}
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(raw)
+		if err != nil {
+			decoded, err = base64.RawURLEncoding.DecodeString(raw)
+			if err != nil {
+				// 兼容测试固件中的非 JSON 占位字符串。
+				return false
+			}
+		}
+	}
+	var payload map[string]any
+	if json.Unmarshal(decoded, &payload) != nil {
+		return false
+	}
+	sid, hasSid := payload["sid"].(string)
+	if !hasSid || strings.TrimSpace(sid) == "" {
+		return true
+	}
+	ftr, _ := payload["ftr"].(string)
+	ark, _ := payload["ark"].(string)
+	bfp, _ := payload["bfp"].(string)
+	if ftr == "" || ark == "" || bfp == "" || strings.Contains(ftr, "___") || strings.HasSuffix(ftr, "__tt") || strings.Contains(ftr, "__UDF9") {
+		return true
+	}
+	parts := strings.Split(ftr, "_")
+	if len(parts) >= 2 {
+		if ts, err := strconv.ParseInt(parts[1], 10, 64); err == nil && ts > 1700000000000 {
+			if now.Sub(time.UnixMilli(ts)) >= 4*time.Hour {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // cookieARPSession 只校验会话基本结构，返回原值，不改写供应商签发的数据。

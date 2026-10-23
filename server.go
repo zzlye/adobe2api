@@ -160,7 +160,7 @@ func (a *App) accountAvailableLocked(account Account, now time.Time) bool {
 	if a.busy[account.ID] && inFlight == 0 {
 		return false
 	}
-	needsRefresh := account.AccessToken == "" || account.UserID == "" || account.Status == "pending" || account.Status == "expired" || (!account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) < time.Minute)
+	needsRefresh := account.AccessToken == "" || account.UserID == "" || account.Status == "pending" || account.Status == "expired" || (!account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) < time.Minute) || (account.Cookie != "" && arpSessionExpired(account.ARPSession, now))
 	if needsRefresh && (a.busy[account.ID] || inFlight > 0) {
 		return false
 	}
@@ -389,7 +389,7 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 	ctx = context.WithValue(ctx, requestLogContextKey{}, &entry)
 	unpin := a.store.PinImages(input.allReferences())
 	defer unpin()
-	if account.AccessToken == "" || account.UserID == "" || account.Status == "pending" || account.Status == "expired" || (!account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) < time.Minute) {
+	if account.AccessToken == "" || account.UserID == "" || account.Status == "pending" || account.Status == "expired" || (!account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) < time.Minute) || (account.Cookie != "" && arpSessionExpired(account.ARPSession, time.Now())) {
 		refreshed, err := a.generator.Refresh(ctx, account)
 		if err != nil {
 			account = mergeConfirmedRefresh(account, refreshed)
@@ -409,6 +409,23 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 		}
 	}
 	result, err := a.generator.Generate(ctx, account, input, &entry)
+	if err != nil && ctx.Err() == nil && account.Cookie != "" {
+		var upstream *UpstreamError
+		if errors.As(err, &upstream) && ((upstream.StatusCode == http.StatusRequestTimeout && upstream.Code == "timeout_error") || upstream.StatusCode == http.StatusUnauthorized) {
+			// 上游返回 408（风险会话过期）或 401（访问令牌失效）时，自动刷新风险会话或令牌并原地重试一次。
+			retryBase := account
+			if upstream.StatusCode == http.StatusRequestTimeout {
+				retryBase.ARPSession = ""
+			} else {
+				retryBase.AccessToken = ""
+			}
+			if refreshed, refreshErr := a.generator.Refresh(ctx, retryBase); refreshErr == nil {
+				account = refreshed
+				_ = saveAccountState(account)
+				result, err = a.generator.Generate(ctx, account, input, &entry)
+			}
+		}
+	}
 	if result.AccountCredits != nil {
 		account.Credits = result.AccountCredits
 	}
@@ -469,11 +486,16 @@ func (a *App) maintenance(ctx context.Context) {
 				if !account.Enabled || time.Since(account.LastRefresh) < time.Duration(settings.RefreshMinutes)*time.Minute {
 					continue
 				}
+				// 访问令牌距过期大于 2 小时且风险会话未超过 4 小时时，无需高频轮换 IMS 会话。
+				tokenFresh := account.AccessToken != "" && account.UserID != "" && account.Status == "ready" && !account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) > 2*time.Hour
+				if tokenFresh && !arpSessionExpired(account.ARPSession, time.Now()) {
+					continue
+				}
 				a.poolMu.Lock()
 				if a.busy == nil {
 					a.busy = make(map[string]bool)
 				}
-				inUse := a.busy[account.ID]
+				inUse := a.busy[account.ID] || a.activeByAccount[account.ID] > 0
 				if !inUse {
 					current, findErr := a.findAdminAccount(account.ID)
 					if findErr != nil || !current.Enabled {
@@ -487,19 +509,27 @@ func (a *App) maintenance(ctx context.Context) {
 				if inUse {
 					continue
 				}
+				wasReady := account.Status == "ready"
 				refreshCtx, cancel := context.WithTimeout(ctx, accountRefreshTimeout)
 				refreshed, refreshErr := a.generator.Refresh(refreshCtx, account)
 				cancel()
+				a.poolMu.Lock()
+				if current, findErr := a.findAdminAccount(account.ID); findErr == nil {
+					account.Name, account.Enabled, account.RequestsPerMinute = current.Name, current.Enabled, current.RequestsPerMinute
+					refreshed.Name, refreshed.Enabled, refreshed.RequestsPerMinute = current.Name, current.Enabled, current.RequestsPerMinute
+				}
 				if refreshErr == nil {
+					if wasReady {
+						refreshed.Status = "ready"
+					}
 					_ = a.store.SaveAccount(refreshed)
-				} else {
+				} else if !tokenFresh {
 					account = mergeConfirmedRefresh(account, refreshed)
 					account.Status = "expired"
 					account.LastError = safeError(refreshErr)
 					account.LastRefresh = time.Now()
 					_ = a.store.SaveAccount(account)
 				}
-				a.poolMu.Lock()
 				delete(a.busy, account.ID)
 				a.poolMu.Unlock()
 				if ctx.Err() != nil {
