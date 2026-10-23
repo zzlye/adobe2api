@@ -239,9 +239,15 @@ func TestAccountPlanInferenceAndSchedulingStrategy(t *testing.T) {
 	}
 	rel2()
 
-	// 不用积分模式下，4K 请求在 Premium 限流时绝不调度需要扣积分的 Pro Plus 账号。
-	if _, _, err := app.reserveAccountForInput(GenerateInput{Model: "gpt-image-2.5-sunburst", Resolution: "4K"}); !errors.Is(err, errRateLimited) {
-		t.Fatalf("不用积分模式下 4K 请求在 Premium 限流时应返回 429 限流，实际: %v", err)
+	// 不用积分模式下，4K、21:9 的 2K（3024x1296）及 GPT 2.5 high/max 画质在 Premium 限流时绝不调度需要扣积分的 Pro Plus 账号。
+	for _, item := range []GenerateInput{
+		{Model: "gpt-image-2.5-sunburst", Resolution: "4K"},
+		{Model: "gpt-image-2.5-sunburst", Resolution: "2K", AspectRatio: "21:9", Size: "3024x1296"},
+		{Model: "gpt-image-2.5-flare", Resolution: "1K", Quality: "high"},
+	} {
+		if _, _, err := app.reserveAccountForInput(item); !errors.Is(err, errRateLimited) {
+			t.Fatalf("不用积分模式下 %+v 在 Premium 限流时应返回 429 限流，实际: %v", item, err)
+		}
 	}
 
 	// 切换为可用积分模式后，4K 请求在 Premium 限流时可回退至有余额的 Pro Plus 账号（重置 Pro Plus 频率计数验证）。

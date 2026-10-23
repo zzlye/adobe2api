@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -160,15 +161,41 @@ func effectiveAccountPlan(account Account) string {
 	return ""
 }
 
-// accountCoversFreeGeneration 判断账号会员等级在当前请求分辨率与模型下是否支持免积分无限生图。
+// inputRequiresPremiumForFree 判断当前请求是否只有 Firefly Premium（5万积分）才能免积分生图。
+func inputRequiresPremiumForFree(input GenerateInput) bool {
+	if input.Resolution == "4K" {
+		return true
+	}
+	// 21:9 的 2K（3024x1296）及任何单边超过 2560 的尺寸在 Adobe 计费中按 4K 计费。
+	if input.Resolution == "2K" && input.AspectRatio == "21:9" {
+		return true
+	}
+	if input.Size != "" && input.Size != "auto" {
+		if w, h, err := parseAdobeSize(input.Size); err == nil && (w > 2560 || h > 2560) {
+			return true
+		}
+	}
+	// GPT Image 2.5 在 high / max 画质（detailLevel > 3）下仅 Premium 套餐免积分。
+	if strings.HasPrefix(input.Model, "gpt-image-2.5") {
+		if input.Quality == "high" || input.Quality == "max" {
+			return true
+		}
+		if input.DetailLevel != nil && *input.DetailLevel > 3 {
+			return true
+		}
+	}
+	return false
+}
+
+// accountCoversFreeGeneration 判断账号会员等级在当前请求分辨率、尺寸与画质下是否支持免积分无限生图。
 func accountCoversFreeGeneration(account Account, input GenerateInput) bool {
 	switch effectiveAccountPlan(account) {
 	case "premium":
 		return true
 	case "pro_plus":
-		return input.Resolution != "4K"
+		return !inputRequiresPremiumForFree(input)
 	case "pro":
-		return (input.Resolution == "" || input.Resolution == "512" || input.Resolution == "1K") && (input.Model == "" || input.Model == "gemini-3.1-flash-image-preview")
+		return !inputRequiresPremiumForFree(input) && (input.Resolution == "" || input.Resolution == "512" || input.Resolution == "1K") && (input.Model == "" || input.Model == "gemini-3.1-flash-image-preview")
 	case "standard", "free", "paid":
 		return false
 	default:

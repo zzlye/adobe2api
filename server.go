@@ -195,7 +195,7 @@ func accountEligibleByCreditUsage(account Account, input GenerateInput, creditUs
 // accountPriorityTier 在“1K/2K 优先 Pro Plus”策略下划分账号优先级（0 最高，1 次优，2 兜底）。
 func accountPriorityTier(account Account, input GenerateInput) int {
 	plan := effectiveAccountPlan(account)
-	if input.Resolution == "4K" {
+	if inputRequiresPremiumForFree(input) {
 		if plan == "premium" {
 			return 0
 		}
