@@ -29,51 +29,6 @@ const accountRefreshTimeout = 150 * time.Second
 
 // 通过页面已有的认证服务获取会话，避免复制会随网页发布变化的模块编号。
 const browserSessionScript = `(async () => {
- const read = source => new Promise((resolve,reject) => {
-  let dispose, done=false;
-  const timer=setTimeout(()=>reject(new Error('会话读取超时')),10000);
-  dispose=source(value=>{if(done)return;done=true;clearTimeout(timer);resolve(value);queueMicrotask(()=>{if(typeof dispose==='function')dispose()})});
- });
- // 页面未透出 SDK 的 allVendorsLoaded，先等待初始采集窗口，再读取近期稳定值。
- // 风险会话有周期更新，短暂稳定即可；只有会话编号的初始值不能作为就绪凭据。
- const readArp = source => new Promise((resolve,reject) => {
-  let dispose,timer,latest=null,firstAt=0,changedAt=0,done=false;
-  const validArp = value => {
-   if(typeof value!=='string'||!value.trim())return false;
-   try {
-    const encoded=value.replace(/-/g,'+').replace(/_/g,'/');
-    const payload=JSON.parse(atob(encoded));
-    if(!payload||typeof payload!=='object'||Array.isArray(payload)||typeof payload.sid!=='string'||!payload.sid.trim())return false;
-    // 与服务端就绪条件一致，不能把只有单个供应商的中间状态当作完成。
-    if(!['ftr','ark','bfp'].every(key=>typeof payload[key]==='string'&&payload[key].trim()))return false;
-    const ftr=payload.ftr;
-    // 供应商内部标记不是公开的有效性协议，完整原值交由上游验证，不按字符串猜测失效。
-    const timestamp=Number(ftr.split('_')[1]);
-    return !(timestamp>1700000000000&&Date.now()-timestamp>=4*60*60*1000);
-   }catch{return false}
-  };
-  const finish = error => {
-   if(done)return;done=true;clearTimeout(timer);
-   if(typeof dispose==='function')dispose();
-   error?reject(error):resolve(latest);
-  };
-  dispose=source(value=>{
-   if(done)return;
-   const now=Date.now();
-   if(value&&!firstAt)firstAt=now;
-   if(value!==latest){latest=value;changedAt=now}
-  });
-  const check = () => {
-   const now=Date.now();
-   const acceptBtn=typeof document!=='undefined'&&document.querySelector?document.querySelector('#onetrust-accept-btn-handler'):null;
-   if(typeof acceptBtn?.click==='function')acceptBtn.click();
-   if(typeof window!=='undefined'&&typeof window.OneTrust?.AllowAll==='function')try{window.OneTrust.AllowAll()}catch{}
-   if(now>deadline)return finish(new Error('Adobe 风险会话尚未完成初始化，请打开已登录的 Adobe 生图页面后重新同步'));
-   if(latest&&firstAt&&now-firstAt>=20000&&now-changedAt>=1500&&validArp(latest))return finish();
-   timer=setTimeout(check,250);
-  };
-  timer=setTimeout(check,250);
- });
  const find = () => {
   const element=document.querySelector('firefly-image-generation');
   if(!element)return null;
@@ -81,23 +36,63 @@ const browserSessionScript = `(async () => {
   let fiber=element[key];
   for(let i=0;fiber&&i<15;i++,fiber=fiber.return){
    const auth=fiber.memoizedProps?.service?.host?.authentication;
-   if(auth?.accessToken&&auth?.arpSessionToken)return auth;
+   if(auth?.accessToken&&auth?.arpSessionToken&&auth?.userProfile)return auth;
   }
   return null;
  };
  const findDeadline=Date.now()+60000;
  let auth;
  while(!(auth=find())){if(Date.now()>findDeadline)throw new Error('Adobe 生图页面未加载完成，请检查网络后重试');await new Promise(r=>setTimeout(r,500))}
- const deadline=Date.now()+60000;
  try{if(window.adobeIMS)await window.adobeIMS.refreshToken()}catch{}
- let token,arp,profile;
- do {
-  [token,arp,profile]=await Promise.all([read(auth.accessToken),readArp(auth.arpSessionToken),read(auth.userProfile)]);
-  if(token&&arp&&profile?.userId)break;
-  if(Date.now()>deadline)throw new Error('Adobe 登录或风险会话已失效，请重新登录并导入 Cookie');
-  await new Promise(r=>setTimeout(r,500));
- }while(true);
- return {access_token:token,arp_session:arp,profile,expires_at:window.adobeIMS?.getAccessToken()?.expire};
+ // SDK 续签和风险采集是两个阶段，前一步不能挤占后面的完整等待窗口。
+ const deadline=Date.now()+60000;
+ return await new Promise((resolve,reject) => {
+  let token=null,profile=null,arp=null,firstAt=0,changedAt=0,timer,done=false;
+  const disposers=[];
+  const validArp = value => {
+   if(typeof value!=='string'||!value.trim())return false;
+   try {
+    const payload=JSON.parse(atob(value.replace(/-/g,'+').replace(/_/g,'/')));
+    if(!payload||typeof payload!=='object'||Array.isArray(payload)||typeof payload.sid!=='string'||!payload.sid.trim())return false;
+    if(!['ftr','ark','bfp'].every(key=>typeof payload[key]==='string'&&payload[key].trim()))return false;
+    // 内部标记不作为失效依据，供应商完整原值交由真实生成验证。
+    const timestamp=Number(payload.ftr.split('_')[1]);
+    return !(timestamp>1700000000000&&Date.now()-timestamp>=4*60*60*1000);
+   }catch{return false}
+  };
+  const finish = error => {
+   if(done)return;done=true;clearTimeout(timer);
+   for(const dispose of disposers)try{dispose()}catch{}
+   if(error)return reject(error);
+   resolve({access_token:token,arp_session:arp,profile,expires_at:window.adobeIMS?.getAccessToken?.()?.expire});
+  };
+  const subscribe = (source,receive) => {
+   const dispose=source(value=>{if(!done)receive(value)});
+   if(typeof dispose==='function')disposers.push(dispose);
+  };
+  try {
+   // 持续保留最新值：空首值不能结束订阅，更不能重新启动一轮二十秒风险等待。
+   subscribe(auth.accessToken,value=>{token=value});
+   subscribe(auth.userProfile,value=>{profile=value});
+   subscribe(auth.arpSessionToken,value=>{
+    const now=Date.now();
+    if(value&&!firstAt)firstAt=now;
+    if(value!==arp){arp=value;changedAt=now}
+   });
+  }catch{return finish(new Error('Adobe 登录会话读取失败，请稍后重试'))}
+  const check = () => {
+   const now=Date.now();
+   const acceptBtn=typeof document!=='undefined'&&document.querySelector?document.querySelector('#onetrust-accept-btn-handler'):null;
+   if(typeof acceptBtn?.click==='function')acceptBtn.click();
+   if(typeof window!=='undefined'&&typeof window.OneTrust?.AllowAll==='function')try{window.OneTrust.AllowAll()}catch{}
+   const loginReady=typeof token==='string'&&token.trim()&&typeof profile?.userId==='string'&&profile.userId.trim();
+   // 三路数据在同一窗口核对；风险周期更新时短暂稳定即可，无需反复重新采集。
+   if(loginReady&&firstAt&&now-firstAt>=20000&&now-changedAt>=1500&&validArp(arp))return finish();
+   if(now>=deadline)return finish(new Error(loginReady?'Adobe 风险会话尚未完成初始化，请打开已登录的 Adobe 生图页面后重新同步':'Adobe 登录会话尚未就绪，请稍后重新同步'));
+   timer=setTimeout(check,250);
+  };
+  timer=setTimeout(check,250);
+ });
 })()`
 
 type browserSession struct {

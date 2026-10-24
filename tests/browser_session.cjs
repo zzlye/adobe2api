@@ -9,16 +9,25 @@ const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url')
 const initial = encode({sid:'测试会话编号'});
 const complete = phase => encode({sid:'测试会话编号',ftr:'测试验证数据'+phase,ark:'测试验证数据',bfp:'测试验证数据'});
 
-async function run(events, componentDelay = 0) {
- let now = 100000, sequence = 0, latest = null, settled = false, result, error;
- const tasks = new Map(), observers = new Set();
+async function run(events, componentDelay = 0, refreshDelay = 0, options = {}) {
+ let now = 100000, sequence = 0, settled = false, result, error;
+ const tasks = new Map(), observers = {token:new Set(),profile:new Set(),arp:new Set()};
+ const subscriptions = {token:0,profile:0,arp:0};
  const schedule = (callback, delay) => {const id=++sequence;tasks.set(id,{at:now+delay,callback});return id;};
- for(const [offset,value] of events)schedule(()=>{latest=value;for(const observer of observers)observer(value);},offset);
- const immediate = value => callback => {callback(value);return ()=>{};};
- const auth = {accessToken:immediate('测试访问令牌'),userProfile:immediate({userId:'测试用户'}),arpSessionToken:callback=>{observers.add(callback);callback(latest);return ()=>observers.delete(callback);}};
- const context = {Date:class extends Date {static now(){return now;}},setTimeout:schedule,clearTimeout:id=>tasks.delete(id),queueMicrotask,atob,window:{adobeIMS:{refreshToken:async()=>{},getAccessToken:()=>({expire:200000})}},document:{querySelector:()=>now-100000<componentDelay?null:({__reactFiberFixture:{memoizedProps:{service:{host:{authentication:auth}}}}})}};
+ // 三类订阅都保留真实的首值与后续更新，覆盖空首值、延迟发值和退出清理。
+ const observable = (kind, initialValue, changes, emitInitially = true) => {
+  let latest = initialValue;
+  for(const [offset,value] of changes)schedule(()=>{latest=value;for(const observer of observers[kind])observer(value);},offset);
+  return callback=>{subscriptions[kind]++;observers[kind].add(callback);if(emitInitially)callback(latest);return ()=>observers[kind].delete(callback);};
+ };
+ const auth = {
+  accessToken:observable('token',Object.hasOwn(options,'initialToken')?options.initialToken:'测试访问令牌',options.tokenEvents||[],options.tokenEmitsInitially!==false),
+  userProfile:observable('profile',Object.hasOwn(options,'initialProfile')?options.initialProfile:{userId:'测试用户'},options.profileEvents||[],options.profileEmitsInitially!==false),
+  arpSessionToken:observable('arp',null,events)
+ };
+ const context = {Date:class extends Date {static now(){return now;}},setTimeout:schedule,clearTimeout:id=>tasks.delete(id),queueMicrotask,atob,window:{adobeIMS:{refreshToken:async()=>{if(refreshDelay)await new Promise(resolve=>schedule(resolve,refreshDelay))},getAccessToken:()=>({expire:200000})}},document:{querySelector:()=>now-100000<componentDelay?null:({__reactFiberFixture:{memoizedProps:{service:{host:{authentication:auth}}}}})}};
  Promise.resolve(vm.runInNewContext(script,context)).then(value=>{result=value;settled=true;},failure=>{error=failure;settled=true;});
- while(!settled&&now<180000){
+ while(!settled&&now<300000){
   await new Promise(resolve=>setImmediate(resolve));
   if(settled)break;
   const next=[...tasks].sort((a,b)=>a[1].at-b[1].at||a[0]-b[0])[0];
@@ -26,7 +35,8 @@ async function run(events, componentDelay = 0) {
   tasks.delete(next[0]);now=next[1].at;next[1].callback();
  }
  await new Promise(resolve=>setImmediate(resolve));
- return {result,error,elapsed:now-100000,remainingObservers:observers.size};
+ const remainingByType=Object.fromEntries(Object.entries(observers).map(([kind,list])=>[kind,list.size]));
+ return {result,error,elapsed:now-100000,remainingObservers:Object.values(remainingByType).reduce((sum,count)=>sum+count,0),remainingByType,subscriptions};
 }
 
 (async()=>{
@@ -89,5 +99,46 @@ async function run(events, componentDelay = 0) {
  assert.equal(slowPage.error,undefined);
  assert.equal(slowPage.result.arp_session,complete(8));
  assert.ok(slowPage.elapsed>=65000);
- console.log('浏览器会话初始化测试通过：异常格式拒绝、完整供应商凭据、中间状态等待、周期更新与稳定窗口');
+ // SDK 续签较慢时，风险采集仍必须拥有独立等待窗口。
+ const slowRefresh=await run([[0,complete(11)]],0,50000);
+ assert.equal(slowRefresh.error,undefined,'SDK 续签耗时挤占了风险采集窗口');
+ assert.equal(slowRefresh.result.arp_session,complete(11));
+ assert.ok(slowRefresh.elapsed>=70000);
+ // 首次发出空令牌或空用户时继续等有效值，不能重启二十秒风险采集窗口。
+ for(const delay of [500,21000]){
+  const delayedToken=await run([[0,complete(12)]],0,0,{initialToken:null,tokenEvents:[[delay,'延迟令牌']]});
+  assert.equal(delayedToken.error,undefined,`令牌在 ${delay} 毫秒就绪后仍然超时`);
+  assert.equal(delayedToken.result?.access_token,'延迟令牌');
+  assert.ok(delayedToken.elapsed>=Math.max(delay,20000)&&delayedToken.elapsed<25000,'空首值额外重启了风险等待窗口');
+  assert.equal(delayedToken.subscriptions.arp,1,'单次同步重复采集风险会话');
+  assert.equal(delayedToken.remainingObservers,0);
+ }
+ const delayedProfile=await run([[0,complete(13)]],0,0,{initialProfile:null,profileEvents:[[21000,{userId:'延迟用户'}]]});
+ assert.equal(delayedProfile.error,undefined,'用户信息在有效窗口内就绪后仍然超时');
+ assert.equal(delayedProfile.result?.profile.userId,'延迟用户');
+ assert.ok(delayedProfile.elapsed>=21000&&delayedProfile.elapsed<25000);
+ assert.equal(delayedProfile.subscriptions.arp,1);
+ assert.equal(delayedProfile.remainingObservers,0);
+ // 第一次回调超过十秒但仍在完整采集窗口内，不能提前放弃并遗留订阅。
+ const firstTokenLate=await run([[0,complete(14)]],0,0,{tokenEmitsInitially:false,tokenEvents:[[12000,'首次延迟令牌']]});
+ assert.equal(firstTokenLate.error,undefined,'首次发值被旧十秒超时提前终止');
+ assert.equal(firstTokenLate.result?.access_token,'首次延迟令牌');
+ assert.ok(firstTokenLate.elapsed>=20000&&firstTokenLate.elapsed<25000);
+ assert.equal(firstTokenLate.remainingObservers,0);
+ // 风险采集期间令牌会更新，最终返回同一时刻的最新凭据，而不是早先的首值。
+ const rotatedToken=await run([[0,complete(16)]],0,0,{initialToken:'旧令牌',tokenEvents:[[1000,'最新令牌']]});
+ assert.equal(rotatedToken.error,undefined);
+ assert.equal(rotatedToken.result?.access_token,'最新令牌','风险采集完成后仍返回二十秒前的旧令牌');
+ assert.ok(rotatedToken.elapsed>=20000&&rotatedToken.elapsed<25000);
+ assert.equal(rotatedToken.subscriptions.arp,1);
+ assert.equal(rotatedToken.remainingObservers,0);
+ // 某个源永不发值时仍须有界退出，其他源和风险采集也必须统一退订。
+ for(const options of [{tokenEmitsInitially:false},{profileEmitsInitially:false}]){
+  const silent=await run([[0,complete(15)]],0,0,options);
+  assert.ok(silent.error,'无有效会话的订阅没有超时退出');
+  assert.equal(silent.result,undefined);
+  assert.ok(silent.elapsed>=60000&&silent.elapsed<65000,'没有使用完整且有界的会话采集窗口');
+  assert.equal(silent.remainingObservers,0,'超时后仍有订阅留在页面中');
+ }
+ console.log('浏览器会话初始化测试通过：完整凭据、独立采集窗口、延迟首值、单次风险采集与订阅清理');
 })().catch(error=>{console.error(error.message);process.exitCode=1;});
