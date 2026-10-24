@@ -496,12 +496,36 @@ func (a *App) refreshAccounts(ctx context.Context) {
 		return
 	}
 	for _, account := range accounts {
-		// 生成繁忙不能证明登录失效，仍按正常续期周期保留完整会话。
-		if !account.Enabled || account.LoginRequired || time.Since(account.LastRefresh) < time.Duration(settings.RefreshMinutes)*time.Minute {
+		if !account.Enabled || account.LoginRequired {
 			continue
 		}
-		// 访问令牌距过期大于 2 小时且风险会话未超过 4 小时时，无需高频轮换 IMS 会话。
 		tokenFresh := account.AccessToken != "" && account.UserID != "" && account.Status == "ready" && !account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) > 2*time.Hour
+		// 当访问令牌充足而风险会话接近上游过期窗口（UDF43 满 4 分钟或 UDFT5 满 6 小时）时，后台无锁通过纯净浏览器预热替换 ARPSession，不阻塞在途生图也不触碰 IMS Cookie。
+		if tokenFresh && !account.RiskRefreshRequired && !arpSessionExpired(account.ARPSession, time.Now()) && arpSessionNeedsProactiveWarmup(account.ARPSession, time.Now()) {
+			if ag, ok := a.generator.(*AdobeGenerator); ok && ag.browserRefresh != nil {
+				warmCtx, cancel := context.WithTimeout(ctx, accountRefreshTimeout)
+				browsed, warmErr := ag.browserRefresh(warmCtx, Account{AccessToken: account.AccessToken, UserID: account.UserID})
+				cancel()
+				if warmErr == nil && !arpSessionExpired(browsed.ARPSession, time.Now()) {
+					a.poolMu.Lock()
+					if current, findErr := a.findAdminAccount(account.ID); findErr == nil {
+						current.ARPSession = browsed.ARPSession
+						current.RiskRefreshRequired = false
+						current.LastRefresh = time.Now().UTC()
+						_ = a.store.SaveAccount(current)
+					}
+					a.poolMu.Unlock()
+				}
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			continue
+		}
+		// 生成繁忙不能证明登录失效，仍按正常续期周期保留完整会话。
+		if time.Since(account.LastRefresh) < time.Duration(settings.RefreshMinutes)*time.Minute {
+			continue
+		}
 		if tokenFresh && !account.RiskRefreshRequired && !arpSessionExpired(account.ARPSession, time.Now()) {
 			continue
 		}

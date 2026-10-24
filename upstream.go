@@ -936,6 +936,12 @@ func (g *AdobeGenerator) Refresh(ctx context.Context, account Account) (updated 
 	if account.RiskRefreshRequired && browsed.ARPSession == account.ARPSession {
 		return browserAccount, errors.New("浏览器仍返回此前被拒绝的风险会话，请重新同步登录状态")
 	}
+	if err == nil && browsed.Cookie == browserAccount.Cookie && browsed.AccessToken == browserAccount.AccessToken {
+		// 第一阶段 IMS 已确认身份并完成 Cookie 轮换，纯净浏览器仅补充风险会话时不再重复请求 IMS。
+		updated.ARPSession = browsed.ARPSession
+		updated.RiskRefreshRequired = false
+		return updated, nil
+	}
 	// 浏览器缓存的令牌可能属于其他权限范围，完成 Cookie 和风险会话后再次由 IMS 规范化。
 	refreshed, refreshErr := g.refreshIMS(ctx, browsed)
 	if refreshErr != nil {
@@ -1109,6 +1115,39 @@ func arpSessionExpired(raw string, now time.Time) bool {
 		}
 	}
 	return false
+}
+
+// arpSessionNeedsProactiveWarmup 判断风险会话是否即将到达上游过期阈值（UDF43 满 4 分钟或 UDFT5 满 6 小时），以便后台无锁预热替换。
+func arpSessionNeedsProactiveWarmup(raw string, now time.Time) bool {
+	if arpSessionExpired(raw, now) {
+		return true
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(raw))
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(strings.TrimSpace(raw))
+		if err != nil {
+			return false
+		}
+	}
+	var payload struct {
+		FTR string `json:"ftr"`
+	}
+	if json.Unmarshal(decoded, &payload) != nil || payload.FTR == "" {
+		return false
+	}
+	parts := strings.Split(payload.FTR, "_")
+	if len(parts) < 2 {
+		return false
+	}
+	ts, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || ts <= 1700000000000 {
+		return false
+	}
+	age := now.Sub(time.UnixMilli(ts))
+	if strings.Contains(payload.FTR, "UDF43") {
+		return age >= 4*time.Minute
+	}
+	return age >= 6*time.Hour
 }
 
 // cookieARPSession 只校验会话基本结构，返回原值，不改写供应商签发的数据。
