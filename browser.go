@@ -95,62 +95,6 @@ const browserSessionScript = `(async () => {
  });
 })()`
 
-// 已有访问令牌与用户标识时，仅在无 Cookie 的纯净浏览器中采集四项风险会话，绝不触碰或轮换 IMS 登录 Cookie。
-const arpOnlySessionScript = `(async () => {
- const find = () => {
-  const element=document.querySelector('firefly-image-generation');
-  if(!element)return null;
-  const key=Object.keys(element).find(key=>key.startsWith('__reactFiber'));
-  let fiber=element[key];
-  for(let i=0;fiber&&i<15;i++,fiber=fiber.return){
-   const auth=fiber.memoizedProps?.service?.host?.authentication;
-   if(auth?.arpSessionToken)return auth;
-  }
-  return null;
- };
- const findDeadline=Date.now()+60000;
- let auth;
- while(!(auth=find())){if(Date.now()>findDeadline)throw new Error('Adobe 生图页面未加载完成，请检查网络后重试');await new Promise(r=>setTimeout(r,500))}
- const deadline=Date.now()+60000;
- return await new Promise((resolve,reject) => {
-  let arp=null,firstAt=0,changedAt=0,timer,done=false,dispose=null;
-  const validArp = value => {
-   if(typeof value!=='string'||!value.trim())return false;
-   try {
-    const payload=JSON.parse(atob(value.replace(/-/g,'+').replace(/_/g,'/')));
-    if(!payload||typeof payload!=='object'||Array.isArray(payload)||typeof payload.sid!=='string'||!payload.sid.trim())return false;
-    if(!['ftr','ark','bfp'].every(key=>typeof payload[key]==='string'&&payload[key].trim())||payload.ftr.includes('___'))return false;
-    const timestamp=Number(payload.ftr.split('_')[1]);
-    return !(timestamp>1700000000000&&Date.now()-timestamp>=7*24*60*60*1000);
-   }catch{return false}
-  };
-  const finish = error => {
-   if(done)return;done=true;clearTimeout(timer);
-   try{if(typeof dispose==='function')dispose()}catch{}
-   if(error)return reject(error);
-   resolve({arp_session:arp});
-  };
-  try {
-   dispose=auth.arpSessionToken(value=>{
-    if(done)return;
-    const now=Date.now();
-    if(value&&!firstAt)firstAt=now;
-    if(value!==arp){arp=value;changedAt=now}
-   });
-  }catch{return finish(new Error('Adobe 风险会话读取失败，请稍后重试'))}
-  const check = () => {
-   const now=Date.now();
-   const acceptBtn=typeof document!=='undefined'&&document.querySelector?document.querySelector('#onetrust-accept-btn-handler'):null;
-   if(typeof acceptBtn?.click==='function')acceptBtn.click();
-   if(typeof window!=='undefined'&&typeof window.OneTrust?.AllowAll==='function')try{window.OneTrust.AllowAll()}catch{}
-   if(firstAt&&now-firstAt>=12000&&now-changedAt>=1500&&validArp(arp))return finish();
-   if(now>=deadline)return finish(new Error('Adobe 风险会话尚未完成初始化，请稍后重试'));
-   timer=setTimeout(check,250);
-  };
-  timer=setTimeout(check,250);
- });
-})()`
-
 type browserSession struct {
 	AccessToken string          `json:"access_token"`
 	ARPSession  string          `json:"arp_session"`
@@ -206,14 +150,13 @@ func validateBrowserSession(account Account, session browserSession) error {
 }
 
 func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoint string) (Account, error) {
-	arpOnly := endpoint == "" && account.AccessToken != "" && adobeUserID(account) != ""
 	var allocCtx context.Context
 	var allocCancel context.CancelFunc
 	if endpoint != "" {
 		// 连接已登录浏览器时仍核对用户标识，防止混用两个账号的会话。
 		allocCtx, allocCancel = remote.NewAllocator(ctx, endpoint)
 	} else {
-		if !arpOnly && account.Cookie == "" {
+		if account.Cookie == "" {
 			return account, errors.New("自动续期需要 Cookie，请在账号池导入登录信息")
 		}
 		profile, err := os.MkdirTemp("", "adobe2api-browser-")
@@ -274,30 +217,34 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 		if err := chromedp.Do(browserCtx, chromedp.Navigate("about:blank")); err != nil {
 			return account, fmt.Errorf("启动续期浏览器失败: %w", err)
 		}
-		if !arpOnly {
-			request := &http.Request{Header: http.Header{"Cookie": []string{account.Cookie}}}
-			skipCookies := map[string]bool{
-				"OptanonConsent":        true,
-				"OptanonAlertBoxClosed": true,
-				"kndctr_9E1005A551ED61CA0A490D45_AdobeOrg_consent": true,
-				"edge_geo_country": true,
-				"sherlockToken":    true,
-				"forter":           true,
-				"forterToken":      true,
-				"ftrset":           true,
-				"ftr_ncd":          true,
-				"ftr_blst_1h":      true,
-				"arkose":           true,
-				"bfp":              true,
-				"ff_session_guid":  true,
+		request := &http.Request{Header: http.Header{"Cookie": []string{account.Cookie}}}
+		skipCookies := map[string]bool{
+			"OptanonConsent":        true,
+			"OptanonAlertBoxClosed": true,
+			"kndctr_9E1005A551ED61CA0A490D45_AdobeOrg_consent": true,
+			"edge_geo_country": true,
+			"sherlockToken":    true,
+			"forter":           true,
+			"forterToken":      true,
+			"ftrset":           true,
+			"ftr_ncd":          true,
+			"ftr_blst_1h":      true,
+			"arkose":           true,
+			"bfp":              true,
+			"ff_session_guid":  true,
+		}
+		// 严格按 Adobe IMS 真实 Cookie 作用域写入：ims_sid 仅写入 .services.adobe.com，防止多域同名旧值冲突。
+		for _, cookie := range request.Cookies() {
+			if skipCookies[cookie.Name] || strings.HasPrefix(cookie.Name, "TR10309906466_") {
+				continue
 			}
-			// 仅向 .adobe.com 写入认证 Cookie，避免 .services.adobe.com 残留旧值覆盖浏览器旋转后的新 ims_sid。
-			for _, cookie := range request.Cookies() {
-				if skipCookies[cookie.Name] || strings.HasPrefix(cookie.Name, "TR10309906466_") {
-					continue
-				}
+			domains := []string{".adobe.com", ".services.adobe.com"}
+			if cookie.Name == "ims_sid" {
+				domains = []string{".services.adobe.com"}
+			}
+			for _, domain := range domains {
 				secure := true
-				_, err := chromedp.Call(browserCtx, network.SetCookie, network.SetCookieParams{Name: cookie.Name, Value: cookie.Value, Domain: ".adobe.com", Path: "/", Secure: &secure})
+				_, err := chromedp.Call(browserCtx, network.SetCookie, network.SetCookieParams{Name: cookie.Name, Value: cookie.Value, Domain: domain, Path: "/", Secure: &secure})
 				if err != nil {
 					return account, errors.New("写入浏览器会话失败")
 				}
@@ -312,13 +259,9 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 			return account, errors.New("Adobe 续期页面连接失败，请检查出口")
 		}
 	}
-	script := browserSessionScript
-	if arpOnly {
-		script = arpOnlySessionScript
-	}
 	var session browserSession
 	for {
-		current, err := chromedp.Run(browserCtx, chromedp.Evaluate[browserSession](script, chromedp.EvalAwaitPromise))
+		current, err := chromedp.Run(browserCtx, chromedp.Evaluate[browserSession](browserSessionScript, chromedp.EvalAwaitPromise))
 		if err == nil {
 			session = current
 			break
@@ -333,16 +276,6 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 			return account, ctx.Err()
 		case <-time.After(250 * time.Millisecond):
 		}
-	}
-	if arpOnly {
-		if arpSessionExpired(session.ARPSession, time.Now()) {
-			return account, errors.New("Adobe 风险会话尚未完成初始化，请重新同步")
-		}
-		account.ARPSession = session.ARPSession
-		account.LastRefresh = time.Now().UTC()
-		account.LastError = ""
-		account.Status = "unverified"
-		return account, nil
 	}
 	if err := validateBrowserSession(account, session); err != nil {
 		return account, err

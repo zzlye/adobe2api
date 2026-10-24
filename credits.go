@@ -85,10 +85,13 @@ func (g *AdobeGenerator) fetchCreditBalance(ctx context.Context, client *http.Cl
 		return nil, err
 	}
 	// 积分计数器使用独立的公开客户端标识，凭据不进入请求记录。
+	adobeBrowserHeaders(request)
 	request.Header.Set("Authorization", "Bearer "+account.AccessToken)
 	request.Header.Set("X-Api-Key", "SunbreakWebUI1")
 	request.Header.Set("X-Account-Id", userID)
 	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Origin", "https://firefly.adobe.com")
+	request.Header.Set("Referer", "https://firefly.adobe.com/")
 	response, err := g.do(client, request, log)
 	if err != nil {
 		return nil, err

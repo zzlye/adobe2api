@@ -86,7 +86,7 @@ func TestRecovery408RebuildsRejectedCookieSession(t *testing.T) {
 				if posts != 1 || response.Code == 200 {
 					t.Error("浏览器失败仍重放了生成请求")
 				}
-			} else if posts != 2 || ims != 1 || response.Code != 200 || saved.ARPSession != fresh {
+			} else if posts != 2 || ims != 2 || response.Code != 200 || saved.ARPSession != fresh {
 				t.Errorf("恢复链路不完整：posts=%d ims=%d status=%d", posts, ims, response.Code)
 			}
 		})
@@ -214,7 +214,7 @@ func TestRecoveryConcurrentRequestsShareOneRefresh(t *testing.T) {
 			wg.Wait()
 			wantIMS, wantBrowsers := int32(1), int32(0)
 			if status == 408 {
-				wantIMS, wantBrowsers = 1, 1
+				wantIMS, wantBrowsers = 2, 1
 			}
 			if firstPosts.Load() != 2 || ims.Load() != wantIMS || browsers.Load() != wantBrowsers {
 				t.Errorf("并发去重失败 posts=%d ims=%d browsers=%d", firstPosts.Load(), ims.Load(), browsers.Load())

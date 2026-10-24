@@ -240,7 +240,7 @@ func (a *App) reserveAccountForInput(input GenerateInput) (Account, func(), erro
 		}
 	}
 	if !hasEnabled {
-		return Account{}, nil, errors.New("暂无可用账号，请检查账号池")
+		return Account{}, nil, errors.New("暂时不可用")
 	}
 	settings := a.store.Settings()
 	hasEligible := false
@@ -251,10 +251,7 @@ func (a *App) reserveAccountForInput(input GenerateInput) (Account, func(), erro
 		}
 	}
 	if !hasEligible {
-		if settings.CreditUsage == "free_only" {
-			return Account{}, nil, errors.New("当前为不用积分模式，暂无支持该规格免积分生图的会员账号")
-		}
-		return Account{}, nil, errors.New("暂无可用积分的账号，请检查账号池")
+		return Account{}, nil, errors.New("暂时不可用")
 	}
 	if a.active >= settings.MaxConcurrent {
 		return Account{}, nil, errRateLimited
@@ -400,7 +397,7 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 	if !accountEligibleByCreditUsage(account, input, a.store.Settings().CreditUsage) {
 		readRelease()
 		entry.HTTPStatus = http.StatusServiceUnavailable
-		return finish(GenerateResult{}, errors.New("当前账号不支持该规格生图，请检查积分策略和套餐"))
+		return finish(GenerateResult{}, errors.New("暂时不可用"))
 	}
 	result, err := a.generator.Generate(ctx, account, input, &entry)
 	readRelease()
@@ -416,7 +413,7 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 					if accountEligibleByCreditUsage(account, input, a.store.Settings().CreditUsage) {
 						result, err = a.generator.Generate(ctx, account, input, &entry)
 					} else {
-						err = errors.New("当前账号已不支持该规格生图")
+						err = errors.New("暂时不可用")
 					}
 					readRelease()
 				}
@@ -496,36 +493,12 @@ func (a *App) refreshAccounts(ctx context.Context) {
 		return
 	}
 	for _, account := range accounts {
-		if !account.Enabled || account.LoginRequired {
-			continue
-		}
-		tokenFresh := account.AccessToken != "" && account.UserID != "" && account.Status == "ready" && !account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) > 2*time.Hour
-		// 当访问令牌充足而风险会话接近上游过期窗口（UDF43 满 4 分钟或 UDFT5 满 6 小时）时，后台无锁通过纯净浏览器预热替换 ARPSession，不阻塞在途生图也不触碰 IMS Cookie。
-		if tokenFresh && !account.RiskRefreshRequired && !arpSessionExpired(account.ARPSession, time.Now()) && arpSessionNeedsProactiveWarmup(account.ARPSession, time.Now()) {
-			if ag, ok := a.generator.(*AdobeGenerator); ok && ag.browserRefresh != nil {
-				warmCtx, cancel := context.WithTimeout(ctx, accountRefreshTimeout)
-				browsed, warmErr := ag.browserRefresh(warmCtx, Account{AccessToken: account.AccessToken, UserID: account.UserID})
-				cancel()
-				if warmErr == nil && !arpSessionExpired(browsed.ARPSession, time.Now()) {
-					a.poolMu.Lock()
-					if current, findErr := a.findAdminAccount(account.ID); findErr == nil {
-						current.ARPSession = browsed.ARPSession
-						current.RiskRefreshRequired = false
-						current.LastRefresh = time.Now().UTC()
-						_ = a.store.SaveAccount(current)
-					}
-					a.poolMu.Unlock()
-				}
-			}
-			if ctx.Err() != nil {
-				return
-			}
-			continue
-		}
 		// 生成繁忙不能证明登录失效，仍按正常续期周期保留完整会话。
-		if time.Since(account.LastRefresh) < time.Duration(settings.RefreshMinutes)*time.Minute {
+		if !account.Enabled || account.LoginRequired || time.Since(account.LastRefresh) < time.Duration(settings.RefreshMinutes)*time.Minute {
 			continue
 		}
+		// 访问令牌距过期大于 2 小时且风险会话有效时，无需高频轮换 IMS 会话。
+		tokenFresh := account.AccessToken != "" && account.UserID != "" && account.Status == "ready" && !account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) > 2*time.Hour
 		if tokenFresh && !account.RiskRefreshRequired && !arpSessionExpired(account.ARPSession, time.Now()) {
 			continue
 		}
