@@ -642,6 +642,16 @@ func adobeGenerationBody(model Model, input GenerateInput, references []map[stri
 	} else if input.Background != "" && input.Background != "auto" {
 		settings["transparentBackground"] = input.Background == "transparent"
 	}
+	if model.Version == "2" {
+		if transparent, ok := settings["transparentBackground"].(bool); ok {
+			if transparent {
+				// 上游仅在 GPT Image 2.5 版本开放 transparentBackground，对 gpt-image-2 透明背景请求自动升级至 2.5。
+				body["modelVersion"] = "gpt-image-2.5-prism"
+			} else {
+				delete(settings, "transparentBackground")
+			}
+		}
+	}
 	body["generationSettings"] = settings
 	return body, nil
 }

@@ -73,7 +73,7 @@ func TestModelOptionBoundariesAndConflicts(t *testing.T) {
 	seed := int64(42)
 	for _, input := range []GenerateInput{
 		{Model: "nano-banana-2", Quality: "max"}, {Model: "nano-banana-pro", Background: "transparent"},
-		{Model: "gpt-image-2", Background: "transparent"}, {Model: "gpt-image-2", DetailLevel: integer(6)},
+		{Model: "gpt-image-1.5", Background: "transparent"}, {Model: "gpt-image-2", DetailLevel: integer(6)},
 		{Model: "gpt-image-2.5-flare", DetailLevel: integer(8)}, {Model: "gpt-image-2.5-flare", Quality: "max", DetailLevel: integer(5)},
 		{Model: "gpt-image-2.5-flare", Background: "opaque", TransparentBackground: boolean(true)},
 		{Model: "gpt-image-2.5-flare", Seed: &seed}, {Model: "gpt-image-2", GroundSearch: boolean(false)},
