@@ -233,21 +233,19 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 			"bfp":              true,
 			"ff_session_guid":  true,
 		}
-		// 严格按 Adobe IMS 真实 Cookie 作用域写入：ims_sid 仅写入 .services.adobe.com，防止多域同名旧值冲突。
+		// 每个 Cookie 仅写入单一真实作用域（ims_sid 写入 .services.adobe.com，其余写入 .adobe.com），彻底杜绝多域同名旧值覆盖旋转后的新值。
 		for _, cookie := range request.Cookies() {
 			if skipCookies[cookie.Name] || strings.HasPrefix(cookie.Name, "TR10309906466_") {
 				continue
 			}
-			domains := []string{".adobe.com", ".services.adobe.com"}
+			domain := ".adobe.com"
 			if cookie.Name == "ims_sid" {
-				domains = []string{".services.adobe.com"}
+				domain = ".services.adobe.com"
 			}
-			for _, domain := range domains {
-				secure := true
-				_, err := chromedp.Call(browserCtx, network.SetCookie, network.SetCookieParams{Name: cookie.Name, Value: cookie.Value, Domain: domain, Path: "/", Secure: &secure})
-				if err != nil {
-					return account, errors.New("写入浏览器会话失败")
-				}
+			secure := true
+			_, err := chromedp.Call(browserCtx, network.SetCookie, network.SetCookieParams{Name: cookie.Name, Value: cookie.Value, Domain: domain, Path: "/", Secure: &secure})
+			if err != nil {
+				return account, errors.New("写入浏览器会话失败")
 			}
 		}
 		// 直接发送导航，不等待广告和统计资源结束；登录服务由下方脚本自行等待。
