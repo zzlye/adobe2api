@@ -439,6 +439,9 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 	if result.AccountPlan != "" {
 		account.Plan = result.AccountPlan
 	}
+	if result.AccountPlanExpiresAt != "" {
+		account.PlanExpiresAt = result.AccountPlanExpiresAt
+	}
 	if err != nil {
 		var upstream *UpstreamError
 		if errors.As(err, &upstream) {

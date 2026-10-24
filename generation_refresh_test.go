@@ -123,7 +123,7 @@ func TestARPSessionExpiryAndOpaqueVendorMarkers(t *testing.T) {
 		return base64.StdEncoding.EncodeToString(raw)
 	}
 	freshARP := makeARP("cd966c780c114ed18f037acd8525af53_"+strconv.FormatInt(now.Add(-2*time.Hour).UnixMilli(), 10)+"__UDFT5_31ck_tt", true)
-	expiredARP := makeARP("cd966c780c114ed18f037acd8525af53_"+strconv.FormatInt(now.Add(-5*time.Hour).UnixMilli(), 10)+"__UDFT5_31ck_tt", true)
+	expiredARP := makeARP("cd966c780c114ed18f037acd8525af53_"+strconv.FormatInt(now.Add(-8*24*time.Hour).UnixMilli(), 10)+"__UDFT5_31ck_tt", true)
 	incompleteARP := makeARP("cd966c780c114ed18f037acd8525af53_"+strconv.FormatInt(now.UnixMilli(), 10)+"__UDFT5_31ck_tt", false)
 	udf9ARP := makeARP("cd966c780c114ed18f037acd8525af53_"+strconv.FormatInt(now.UnixMilli(), 10)+"__UDF9_13ck_tt", true)
 	if arpSessionExpired(freshARP, now) {

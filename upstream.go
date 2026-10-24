@@ -699,6 +699,7 @@ func (g *AdobeGenerator) Generate(ctx context.Context, account Account, input Ge
 		result.AccountCredits = before.Total.Quota.Available
 		result.AccountCreditsTotal = before.Total.Quota.Total
 		result.AccountPlan = inferAccountPlan(*before.Total.Quota.Total, before.Total.PlanCap)
+		result.AccountPlanExpiresAt = strings.TrimSpace(before.Total.AvailableUntil)
 	}
 	defer func() {
 		if before != nil {
@@ -707,6 +708,7 @@ func (g *AdobeGenerator) Generate(ctx context.Context, account Account, input Ge
 				result.AccountCredits = after.Total.Quota.Available
 				result.AccountCreditsTotal = after.Total.Quota.Total
 				result.AccountPlan = inferAccountPlan(*after.Total.Quota.Total, after.Total.PlanCap)
+				result.AccountPlanExpiresAt = strings.TrimSpace(after.Total.AvailableUntil)
 			}
 			result.Credits = creditConsumption(before, after)
 		}
@@ -883,6 +885,7 @@ func (g *AdobeGenerator) Refresh(ctx context.Context, account Account) (updated 
 		updated.Credits = nil
 		updated.CreditsTotal = nil
 		updated.Plan = ""
+		updated.PlanExpiresAt = ""
 		client, _, clientErr := g.clients()
 		if clientErr == nil {
 			if balance := g.readCreditBalance(ctx, client, updated, nil); balance != nil {
@@ -1100,7 +1103,7 @@ func arpSessionExpired(raw string, now time.Time) bool {
 	parts := strings.Split(ftr, "_")
 	if len(parts) >= 2 {
 		if ts, err := strconv.ParseInt(parts[1], 10, 64); err == nil && ts > 1700000000000 {
-			if now.Sub(time.UnixMilli(ts)) >= 4*time.Hour {
+			if now.Sub(time.UnixMilli(ts)) >= 7*24*time.Hour {
 				return true
 			}
 		}

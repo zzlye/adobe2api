@@ -48,6 +48,7 @@ type Account struct {
 	Credits           *float64  `json:"credits"`
 	CreditsTotal      *float64  `json:"credits_total,omitempty"`
 	Plan              string    `json:"plan,omitempty"`
+	PlanExpiresAt     string    `json:"plan_expires_at,omitempty"`
 	RequestsPerMinute int       `json:"requests_per_minute"`
 	BrowserProfile    string    `json:"browser_profile,omitempty"`
 }
@@ -155,11 +156,12 @@ type AdobeOutput struct {
 }
 
 type GenerateResult struct {
-	Images              []ImageRecord
-	Credits             *float64
-	AccountCredits      *float64
-	AccountCreditsTotal *float64
-	AccountPlan         string
+	Images               []ImageRecord
+	Credits              *float64
+	AccountCredits       *float64
+	AccountCreditsTotal  *float64
+	AccountPlan          string
+	AccountPlanExpiresAt string
 }
 
 // Generator 将协议转换和上游生成分开，便于验证协议与真实请求行为。

@@ -127,7 +127,14 @@ function planBadge(account) {
   };
   if (!labels[key]) return el('span', { class: 'badge disabled', text: '待识别' });
   const cls = key === 'premium' ? 'plan-premium' : key === 'pro_plus' ? 'plan-pro-plus' : key === 'pro' ? 'plan-pro' : key === 'free' ? 'warning' : 'success';
-  return el('span', { class: `badge ${cls}`, text: labels[key] });
+  // 鼠标移入会员徽标显示套餐到期剩余天数与具体到期日期。
+  return el('span', {
+    class: `badge ${cls}`,
+    style: 'cursor: pointer',
+    text: labels[key],
+    onmouseenter: event => showPlanExpiryPopover(event.currentTarget, account, labels[key]),
+    onmouseleave: () => hideAccountStatsPopover()
+  });
 }
 function errorMessage(error) { return error instanceof Error ? error.message : String(error || '操作失败'); }
 function toast(message, isError = false) {
@@ -358,6 +365,51 @@ async function loadAccounts() {
     renderAccounts();
   } catch (error) { if (request === state.accountsRequest) showError($('#accounts-empty'), error, loadAccounts); }
 }
+function positionPopover(popover, anchor) {
+  const rect = anchor.getBoundingClientRect();
+  const popRect = popover.getBoundingClientRect();
+  let top = rect.bottom + 8;
+  if (top + popRect.height > window.innerHeight - 12 && rect.top - popRect.height - 8 > 12) {
+    top = rect.top - popRect.height - 8;
+  }
+  let left = rect.left + rect.width / 2 - popRect.width / 2;
+  left = Math.max(12, Math.min(window.innerWidth - popRect.width - 12, left));
+  popover.style.top = `${Math.round(top)}px`;
+  popover.style.left = `${Math.round(left)}px`;
+}
+function showPlanExpiryPopover(anchor, account, planLabel) {
+  const popover = $('#account-stats-popover');
+  if (!popover) return;
+  const raw = account?.plan_expires_at;
+  const exp = raw ? new Date(raw) : null;
+  const valid = exp && !Number.isNaN(exp.getTime()) && !String(raw).startsWith('0001-');
+  let remainText = '待同步';
+  if (valid) {
+    const diffMs = exp.getTime() - Date.now();
+    if (diffMs <= 0) {
+      remainText = '已到期';
+    } else {
+      const days = Math.floor(diffMs / 86400000);
+      const hours = Math.floor((diffMs % 86400000) / 3600000);
+      remainText = days > 0 ? `剩余 ${days} 天 ${hours} 小时` : `剩余 ${Math.max(1, hours)} 小时`;
+    }
+  }
+  const head = el('div', { class: 'stats-popover-head' },
+    el('span', { text: planLabel || '会员套餐' }),
+    el('span', { class: 'stats-popover-credits', text: remainText })
+  );
+  const body = valid
+    ? el('div', { class: 'stats-popover-list' },
+        el('div', { class: 'stats-popover-row' },
+          el('span', { class: 'stats-popover-model', text: '到期时间' }),
+          el('span', { class: 'stats-popover-meta', text: date(raw) })
+        )
+      )
+    : el('div', { class: 'stats-popover-empty', text: '生图或刷新后自动同步到期日期' });
+  popover.replaceChildren(head, body);
+  popover.hidden = false;
+  positionPopover(popover, anchor);
+}
 function showAccountStatsPopover(anchor, account) {
   const popover = $('#account-stats-popover');
   if (!popover) return;
@@ -376,16 +428,7 @@ function showAccountStatsPopover(anchor, account) {
     : el('div', { class: 'stats-popover-empty', text: '暂无模型生成记录' });
   popover.replaceChildren(head, body);
   popover.hidden = false;
-  const rect = anchor.getBoundingClientRect();
-  const popRect = popover.getBoundingClientRect();
-  let top = rect.bottom + 8;
-  if (top + popRect.height > window.innerHeight - 12 && rect.top - popRect.height - 8 > 12) {
-    top = rect.top - popRect.height - 8;
-  }
-  let left = rect.left + rect.width / 2 - popRect.width / 2;
-  left = Math.max(12, Math.min(window.innerWidth - popRect.width - 12, left));
-  popover.style.top = `${Math.round(top)}px`;
-  popover.style.left = `${Math.round(left)}px`;
+  positionPopover(popover, anchor);
 }
 function hideAccountStatsPopover() {
   const popover = $('#account-stats-popover');

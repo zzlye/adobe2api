@@ -144,7 +144,7 @@ func TestRecoveryMaintenanceKeepsPartialRotation(t *testing.T) {
 	app, g, account := recoveryTestApp(t, func(r *http.Request) (*http.Response, error) {
 		return adobeTestResponse(200, http.Header{"Set-Cookie": {"ims_sid=maintenance-rotated"}}, `{"access_token":"maintenance-token","userId":"test-user","expires_in":86400000}`), nil
 	})
-	account.ARPSession = recoveryTestARP("expired", 5*time.Hour)
+	account.ARPSession = recoveryTestARP("expired", 8*24*time.Hour)
 	if err := app.store.SaveAccount(account); err != nil {
 		t.Fatal(err)
 	}

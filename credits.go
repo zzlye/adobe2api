@@ -136,6 +136,9 @@ func applyCreditBalance(account *Account, balance *adobeCreditBalance) {
 	account.Credits = &available
 	account.CreditsTotal = &total
 	account.Plan = inferAccountPlan(total, balance.Total.PlanCap)
+	if until := strings.TrimSpace(balance.Total.AvailableUntil); until != "" {
+		account.PlanExpiresAt = until
+	}
 }
 
 // effectiveAccountPlan 返回账号当前识别出的会员等级，兼容旧数据按总额或可用余额推断。

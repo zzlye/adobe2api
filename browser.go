@@ -43,7 +43,7 @@ const browserSessionScript = `(async () => {
  const findDeadline=Date.now()+60000;
  let auth;
  while(!(auth=find())){if(Date.now()>findDeadline)throw new Error('Adobe 生图页面未加载完成，请检查网络后重试');await new Promise(r=>setTimeout(r,500))}
- try{if(window.adobeIMS)await window.adobeIMS.refreshToken()}catch{}
+ try{if(window.adobeIMS&&!window.adobeIMS.getAccessToken?.()?.token)await window.adobeIMS.refreshToken()}catch{}
  // SDK 续签和风险采集是两个阶段，前一步不能挤占后面的完整等待窗口。
  const deadline=Date.now()+60000;
  return await new Promise((resolve,reject) => {
@@ -57,7 +57,7 @@ const browserSessionScript = `(async () => {
     if(!['ftr','ark','bfp'].every(key=>typeof payload[key]==='string'&&payload[key].trim()))return false;
     // 内部标记不作为失效依据，供应商完整原值交由真实生成验证。
     const timestamp=Number(payload.ftr.split('_')[1]);
-    return !(timestamp>1700000000000&&Date.now()-timestamp>=4*60*60*1000);
+    return !(timestamp>1700000000000&&Date.now()-timestamp>=7*24*60*60*1000);
    }catch{return false}
   };
   const finish = error => {
