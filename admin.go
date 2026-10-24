@@ -471,6 +471,8 @@ func (a *App) adminUpdateAccount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if cookie != account.Cookie {
+			// 新登录信息需要重新校验，解除旧凭据认证失败造成的自动分配暂停。
+			account.LoginRequired = false
 			if sameAdobeCookieSession(account.Cookie, cookie) {
 				account.Cookie, account.Status, account.LastError = cookie, "pending", ""
 				if arp := cookieARPSession(cookie); arp != "" {
@@ -583,6 +585,7 @@ func (a *App) adminImportAccount(w http.ResponseWriter, r *http.Request) {
 			account.ARPSession = arp
 		}
 		account.Status, account.LastError = "pending", ""
+		account.LoginRequired = false
 		status = http.StatusOK
 		break
 	}
@@ -721,6 +724,7 @@ func (a *App) adminBrowserAccount(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		failed := mergeConfirmedRefresh(refreshBase, account)
 		failed.Status, failed.LastError = "expired", safeError(err)
+		failed.LoginRequired = failed.LoginRequired || adobeLoginRequired(err)
 		if failed.Name == "" {
 			failed.Name = "Adobe 账号"
 		}
@@ -744,6 +748,7 @@ func (a *App) adminBrowserAccount(w http.ResponseWriter, r *http.Request) {
 		account.Name = "Adobe 账号"
 	}
 	account.Status, account.LastError, account.LastRefresh = "unverified", "", time.Now().UTC()
+	account.LoginRequired = false
 	account.Nonce = ""
 	if err := a.store.SaveAccount(account); err != nil {
 		writeError(w, http.StatusInternalServerError, "保存浏览器账号失败")
@@ -852,6 +857,7 @@ func (a *App) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		account = mergeConfirmedRefresh(refreshBase, updated)
 		account.Status, account.LastError = "expired", safeError(err)
+		account.LoginRequired = account.LoginRequired || adobeLoginRequired(err)
 		if errors.Is(err, context.DeadlineExceeded) {
 			account.LastError = "登录刷新超时，请稍后重试"
 		} else if errors.Is(err, context.Canceled) {
@@ -867,6 +873,7 @@ func (a *App) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 		updated.Name, updated.Enabled, updated.RequestsPerMinute = current.Name, current.Enabled, current.RequestsPerMinute
 	}
 	updated.LastError, updated.Status = "", "unverified"
+	updated.LoginRequired = false
 	if err := a.store.SaveAccount(updated); err != nil {
 		writeError(w, http.StatusInternalServerError, "保存刷新结果失败")
 		return

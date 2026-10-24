@@ -37,17 +37,19 @@ type Account struct {
 	APIKey       string `json:"api_key,omitempty"`
 	ARPSession   string `json:"arp_session,omitempty"`
 	// 风险恢复意图独立于令牌有效期保存，防止旧 Cookie 回填后跳过浏览器重建。
-	RiskRefreshRequired bool      `json:"risk_refresh_required,omitempty"`
-	Nonce               string    `json:"nonce,omitempty"`
-	ExpiresAt           time.Time `json:"expires_at"`
-	LastRefresh         time.Time `json:"last_refresh"`
-	Status              string    `json:"status"`
-	LastError           string    `json:"last_error"`
-	Credits             *float64  `json:"credits"`
-	CreditsTotal        *float64  `json:"credits_total,omitempty"`
-	Plan                string    `json:"plan,omitempty"`
-	RequestsPerMinute   int       `json:"requests_per_minute"`
-	BrowserProfile      string    `json:"browser_profile,omitempty"`
+	RiskRefreshRequired bool `json:"risk_refresh_required,omitempty"`
+	// IMS 明确撤销且浏览器恢复失败后暂停自动续签，新会话或手动刷新成功后解除。
+	LoginRequired     bool      `json:"login_required,omitempty"`
+	Nonce             string    `json:"nonce,omitempty"`
+	ExpiresAt         time.Time `json:"expires_at"`
+	LastRefresh       time.Time `json:"last_refresh"`
+	Status            string    `json:"status"`
+	LastError         string    `json:"last_error"`
+	Credits           *float64  `json:"credits"`
+	CreditsTotal      *float64  `json:"credits_total,omitempty"`
+	Plan              string    `json:"plan,omitempty"`
+	RequestsPerMinute int       `json:"requests_per_minute"`
+	BrowserProfile    string    `json:"browser_profile,omitempty"`
 }
 
 // ImageRecord 只保存文件元信息，图片本体按需从磁盘读取。

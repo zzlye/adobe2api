@@ -20,6 +20,12 @@ func (a *App) sessionGate(id string) *accountSessionGate {
 	return a.sessionGates[id]
 }
 
+// 仅在 IMS 明确拒绝登录凭据时停止自动重试；网络故障、408 和普通令牌失效仍可恢复。
+func adobeLoginRequired(err error) bool {
+	var upstream *UpstreamError
+	return errors.As(err, &upstream) && upstream.StatusCode == http.StatusUnauthorized && upstream.Code == "invalid_credentials"
+}
+
 func accountNeedsRefresh(account Account, now time.Time) bool {
 	return account.RiskRefreshRequired || account.AccessToken == "" || account.UserID == "" || account.Status == "pending" || account.Status == "expired" || (!account.ExpiresAt.IsZero() && account.ExpiresAt.Sub(now) < time.Minute) || (account.Cookie != "" && arpSessionExpired(account.ARPSession, now))
 }
@@ -51,6 +57,7 @@ func (a *App) saveGenerationAccount(account Account) error {
 		account.Cookie, account.AccessToken, account.RefreshToken, account.ARPSession = current.Cookie, current.AccessToken, current.RefreshToken, current.ARPSession
 		account.ExpiresAt, account.LastRefresh = current.ExpiresAt, current.LastRefresh
 		account.RiskRefreshRequired = current.RiskRefreshRequired
+		account.LoginRequired = current.LoginRequired
 		account.Status, account.LastError = current.Status, current.LastError
 	}
 	return a.store.SaveAccount(account)
@@ -66,6 +73,10 @@ func (a *App) refreshGenerationAccount(ctx context.Context, failed Account, reje
 	current, err := a.findAdminAccount(failed.ID)
 	if err != nil {
 		return failed, err
+	}
+	// 已排队的失败请求也必须复用认证失败结论，不能再次轮换已被拒绝的凭据。
+	if current.LoginRequired {
+		return current, errors.New("Adobe 登录状态已失效，请重新同步登录信息")
 	}
 	if rejection == nil {
 		if !accountNeedsRefresh(current, time.Now()) {
@@ -93,6 +104,9 @@ func (a *App) refreshGenerationAccount(ctx context.Context, failed Account, reje
 		// 记录本轮尝试，阻止旧请求的成功收尾把恢复意图和失败状态覆盖回去。
 		updated.LastRefresh = time.Now().UTC()
 		updated.Status, updated.LastError = "error", safeError(refreshErr)
+		updated.LoginRequired = updated.LoginRequired || adobeLoginRequired(refreshErr)
+	} else {
+		updated.LoginRequired = false
 	}
 	// 必须在释放写侧之前落盘，否则等待者仍可能拿旧 Cookie 再次续签。
 	if saveErr := a.saveGenerationAccount(updated); saveErr != nil {

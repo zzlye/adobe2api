@@ -154,7 +154,7 @@ func (a *App) apiOnly(next http.HandlerFunc) http.HandlerFunc {
 
 // accountAvailableLocked 同时检查账号启用状态、后台刷新占用与一分钟滑动窗口内的请求配额。
 func (a *App) accountAvailableLocked(account Account, now time.Time) bool {
-	if !account.Enabled {
+	if !account.Enabled || account.LoginRequired {
 		return false
 	}
 	inFlight := a.activeByAccount[account.ID]
@@ -185,7 +185,7 @@ func (a *App) accountAvailableLocked(account Account, now time.Time) bool {
 
 // accountEligibleByCreditUsage 根据积分消耗策略判断账号是否允许参与当前规格生图。
 func accountEligibleByCreditUsage(account Account, input GenerateInput, creditUsage string) bool {
-	if !account.Enabled {
+	if !account.Enabled || account.LoginRequired {
 		return false
 	}
 	if creditUsage == "free_only" {
@@ -234,7 +234,7 @@ func (a *App) reserveAccountForInput(input GenerateInput) (Account, func(), erro
 	}
 	hasEnabled := false
 	for _, account := range accounts {
-		if account.Enabled {
+		if account.Enabled && !account.LoginRequired {
 			hasEnabled = true
 			break
 		}
@@ -494,7 +494,7 @@ func (a *App) refreshAccounts(ctx context.Context) {
 	}
 	for _, account := range accounts {
 		// 生成繁忙不能证明登录失效，仍按正常续期周期保留完整会话。
-		if !account.Enabled || time.Since(account.LastRefresh) < time.Duration(settings.RefreshMinutes)*time.Minute {
+		if !account.Enabled || account.LoginRequired || time.Since(account.LastRefresh) < time.Duration(settings.RefreshMinutes)*time.Minute {
 			continue
 		}
 		// 访问令牌距过期大于 2 小时且风险会话未超过 4 小时时，无需高频轮换 IMS 会话。
@@ -530,6 +530,7 @@ func (a *App) refreshAccounts(ctx context.Context) {
 			refreshed.Name, refreshed.Enabled, refreshed.RequestsPerMinute = current.Name, current.Enabled, current.RequestsPerMinute
 		}
 		if refreshErr == nil {
+			refreshed.LoginRequired = false
 			if wasReady {
 				refreshed.Status = "ready"
 			}
@@ -542,6 +543,7 @@ func (a *App) refreshAccounts(ctx context.Context) {
 				account.Status = "expired"
 			}
 			account.LastError = safeError(refreshErr)
+			account.LoginRequired = account.LoginRequired || adobeLoginRequired(refreshErr)
 			account.LastRefresh = time.Now()
 			_ = a.store.SaveAccount(account)
 		}

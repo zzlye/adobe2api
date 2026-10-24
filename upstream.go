@@ -914,6 +914,10 @@ func (g *AdobeGenerator) Refresh(ctx context.Context, account Account) (updated 
 	}
 	browsed, browserErr := g.browserRefresh(ctx, browserAccount)
 	if browserErr != nil {
+		// 保留 IMS 的明确认证拒绝，避免被页面未登录的等待超时掩盖；取消仍按取消处理。
+		if ctx.Err() == nil && adobeLoginRequired(err) {
+			return browserAccount, errors.Join(err, browserErr)
+		}
 		return browserAccount, browserErr
 	}
 	expectedUserID := adobeUserID(browserAccount)
