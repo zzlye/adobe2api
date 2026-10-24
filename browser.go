@@ -60,6 +60,10 @@ const browserSessionScript = `(async () => {
     return !(timestamp>1700000000000&&Date.now()-timestamp>=7*24*60*60*1000);
    }catch{return false}
   };
+  const isUDFT5 = value => {
+   if(!validArp(value))return false;
+   try{return JSON.parse(atob(value.replace(/-/g,'+').replace(/_/g,'/'))).ftr.includes('UDFT5')}catch{return false}
+  };
   const finish = error => {
    if(done)return;done=true;clearTimeout(timer);
    for(const dispose of disposers)try{dispose()}catch{}
@@ -77,7 +81,7 @@ const browserSessionScript = `(async () => {
    subscribe(auth.arpSessionToken,value=>{
     const now=Date.now();
     if(value&&!firstAt)firstAt=now;
-    if(value!==arp){arp=value;changedAt=now}
+    if(value!==arp&&!isUDFT5(arp)){arp=value;changedAt=now}
    });
   }catch{return finish(new Error('Adobe 登录会话读取失败，请稍后重试'))}
   const check = () => {
@@ -170,6 +174,7 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 			chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"),
 			chromedp.WindowSize(1920, 1080),
 			chromedp.Flag("disable-blink-features", "AutomationControlled"),
+			chromedp.Flag("host-resolver-rules", "MAP *.forter.com 10.255.255.1, MAP forter.com 10.255.255.1, MAP d2g5iz6v9rfepzt.cloudfront.net 10.255.255.1, MAP app.siteperformancetest.net 10.255.255.1"),
 			chromedp.Flag("disable-dev-shm-usage", true),
 			chromedp.Flag("disk-cache-size", "8388608"),
 			chromedp.Flag("media-cache-size", "1048576"),
