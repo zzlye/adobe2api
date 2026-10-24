@@ -30,9 +30,8 @@ func init() {
 			m.SupportsMask = true
 			m.Qualities = []string{"auto", "low", "medium", "high", "max"}
 			m.SupportsCustomSize = m.Version != "1.5"
-			m.SupportsTransparency = m.Version != "1.5"
 			if strings.HasPrefix(m.Version, "gpt-image-2.5-") {
-				m.MaxDetailLevel = 7
+				m.MaxDetailLevel, m.SupportsTransparency = 7, true
 				m.Ratios = []string{"auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5", "21:9"}
 			}
 		}
