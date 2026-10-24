@@ -32,6 +32,7 @@ type App struct {
 	adminAuth       *adminAuth
 	poolMu          sync.Mutex
 	busy            map[string]bool
+	sessionGates    map[string]*accountSessionGate
 	activeByAccount map[string]int
 	requestHistory  map[string][]time.Time
 	active          int
@@ -160,7 +161,7 @@ func (a *App) accountAvailableLocked(account Account, now time.Time) bool {
 	if a.busy[account.ID] && inFlight == 0 {
 		return false
 	}
-	needsRefresh := account.AccessToken == "" || account.UserID == "" || account.Status == "pending" || account.Status == "expired" || (!account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) < time.Minute) || (account.Cookie != "" && arpSessionExpired(account.ARPSession, now))
+	needsRefresh := accountNeedsRefresh(account, now)
 	if needsRefresh && (a.busy[account.ID] || inFlight > 0) {
 		return false
 	}
@@ -370,18 +371,7 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 		return finish(GenerateResult{}, err)
 	}
 	defer release()
-	saveAccountState := func(acc Account) error {
-		a.poolMu.Lock()
-		defer a.poolMu.Unlock()
-		if current, findErr := a.findAdminAccount(acc.ID); findErr == nil {
-			acc.Name, acc.Enabled, acc.RequestsPerMinute = current.Name, current.Enabled, current.RequestsPerMinute
-			if current.LastRefresh.After(acc.LastRefresh) {
-				acc.Cookie, acc.AccessToken, acc.RefreshToken, acc.ARPSession = current.Cookie, current.AccessToken, current.RefreshToken, current.ARPSession
-				acc.ExpiresAt, acc.LastRefresh = current.ExpiresAt, current.LastRefresh
-			}
-		}
-		return a.store.SaveAccount(acc)
-	}
+	saveAccountState := a.saveGenerationAccount
 	entry.AccountID = account.ID
 	entry.AccountName = account.Name
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(a.store.Settings().RequestTimeoutSeconds)*time.Second)
@@ -389,40 +379,54 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 	ctx = context.WithValue(ctx, requestLogContextKey{}, &entry)
 	unpin := a.store.PinImages(input.allReferences())
 	defer unpin()
-	if account.AccessToken == "" || account.UserID == "" || account.Status == "pending" || account.Status == "expired" || (!account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) < time.Minute) || (account.Cookie != "" && arpSessionExpired(account.ARPSession, time.Now())) {
-		refreshed, err := a.generator.Refresh(ctx, account)
+	account, readRelease, err := a.readGenerationAccount(ctx, account.ID)
+	if err != nil {
+		return finish(GenerateResult{}, err)
+	}
+	if accountNeedsRefresh(account, time.Now()) {
+		readRelease()
+		account, err = a.refreshGenerationAccount(ctx, account, nil)
 		if err != nil {
-			account = mergeConfirmedRefresh(account, refreshed)
-			account.LastError = safeError(err)
-			account.Status = "expired"
+			account.LastError, account.Status = safeError(err), "expired"
 			_ = saveAccountState(account)
 			entry.HTTPStatus = 503
 			return finish(GenerateResult{}, err)
 		}
-		account = refreshed
-		if err := saveAccountState(account); err != nil {
+		account, readRelease, err = a.readGenerationAccount(ctx, account.ID)
+		if err != nil {
 			return finish(GenerateResult{}, err)
 		}
-		if !accountEligibleByCreditUsage(account, input, a.store.Settings().CreditUsage) {
-			entry.HTTPStatus = http.StatusServiceUnavailable
-			return finish(GenerateResult{}, errors.New("当前为不用积分模式，暂无支持该规格免积分生图的会员账号"))
-		}
+	}
+	if !accountEligibleByCreditUsage(account, input, a.store.Settings().CreditUsage) {
+		readRelease()
+		entry.HTTPStatus = http.StatusServiceUnavailable
+		return finish(GenerateResult{}, errors.New("当前账号不支持该规格生图，请检查积分策略和套餐"))
 	}
 	result, err := a.generator.Generate(ctx, account, input, &entry)
+	readRelease()
 	if err != nil && ctx.Err() == nil && account.Cookie != "" {
 		var upstream *UpstreamError
-		if errors.As(err, &upstream) && ((upstream.StatusCode == http.StatusRequestTimeout && upstream.Code == "timeout_error") || upstream.StatusCode == http.StatusUnauthorized) {
-			// 上游返回 408（风险会话过期）或 401（访问令牌失效）时，自动刷新风险会话或令牌并原地重试一次。
-			retryBase := account
-			if upstream.StatusCode == http.StatusRequestTimeout {
-				retryBase.ARPSession = ""
-			} else {
-				retryBase.AccessToken = ""
+		if errors.As(err, &upstream) && upstream.RetrySafe {
+			// 只有首个提交明确被拒绝才恢复一次；已接受的任务绝不整单重放。
+			var refreshErr error
+			account, refreshErr = a.refreshGenerationAccount(ctx, account, upstream)
+			if refreshErr == nil {
+				account, readRelease, refreshErr = a.readGenerationAccount(ctx, account.ID)
+				if refreshErr == nil {
+					if accountEligibleByCreditUsage(account, input, a.store.Settings().CreditUsage) {
+						result, err = a.generator.Generate(ctx, account, input, &entry)
+					} else {
+						err = errors.New("当前账号已不支持该规格生图")
+					}
+					readRelease()
+				}
 			}
-			if refreshed, refreshErr := a.generator.Refresh(ctx, retryBase); refreshErr == nil {
-				account = refreshed
-				_ = saveAccountState(account)
-				result, err = a.generator.Generate(ctx, account, input, &entry)
+			if refreshErr != nil {
+				if errors.Is(refreshErr, context.Canceled) || errors.Is(refreshErr, context.DeadlineExceeded) {
+					err = refreshErr
+				} else {
+					err = &UpstreamError{StatusCode: http.StatusServiceUnavailable, Code: "session_refresh_failed", Message: "上游拒绝请求，自动恢复登录会话失败：" + safeError(refreshErr)}
+				}
 			}
 		}
 	}
@@ -445,7 +449,7 @@ func (a *App) runGenerate(ctx context.Context, input GenerateInput, protocol, en
 			account.LastError = safeError(err)
 			account.Status = "error"
 			// 模型无权限属于账号套餐错误，不能要求有效登录重新续期。
-			if upstream != nil && (upstream.StatusCode == 401 || upstream.StatusCode == 403 && upstream.AccessError != "user_not_entitled") {
+			if upstream != nil && upstream.Code != "image_download_failed" && (upstream.StatusCode == 401 || upstream.StatusCode == 403 && upstream.AccessError != "user_not_entitled") {
 				account.Status = "expired"
 			}
 			_ = saveAccountState(account)
@@ -473,69 +477,78 @@ func (a *App) maintenance(ctx context.Context) {
 			if err := a.store.Cleanup(ctx); err != nil {
 				log.Print("图片清理失败")
 			}
-			settings := a.store.Settings()
-			if settings.RefreshMinutes == 0 {
+			a.refreshAccounts(ctx)
+		}
+	}
+}
+
+// 单轮后台续期独立执行，便于覆盖轮换成功但浏览器失败的完整保存分支。
+func (a *App) refreshAccounts(ctx context.Context) {
+	settings := a.store.Settings()
+	if settings.RefreshMinutes == 0 {
+		return
+	}
+	accounts, err := a.store.Accounts()
+	if err != nil {
+		return
+	}
+	for _, account := range accounts {
+		// 生成繁忙不能证明登录失效，仍按正常续期周期保留完整会话。
+		if !account.Enabled || time.Since(account.LastRefresh) < time.Duration(settings.RefreshMinutes)*time.Minute {
+			continue
+		}
+		// 访问令牌距过期大于 2 小时且风险会话未超过 4 小时时，无需高频轮换 IMS 会话。
+		tokenFresh := account.AccessToken != "" && account.UserID != "" && account.Status == "ready" && !account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) > 2*time.Hour
+		if tokenFresh && !account.RiskRefreshRequired && !arpSessionExpired(account.ARPSession, time.Now()) {
+			continue
+		}
+		a.poolMu.Lock()
+		if a.busy == nil {
+			a.busy = make(map[string]bool)
+		}
+		inUse := a.busy[account.ID] || a.activeByAccount[account.ID] > 0
+		if !inUse {
+			current, findErr := a.findAdminAccount(account.ID)
+			if findErr != nil || !current.Enabled {
+				a.poolMu.Unlock()
 				continue
 			}
-			accounts, err := a.store.Accounts()
-			if err != nil {
-				continue
+			account = current
+			a.busy[account.ID] = true
+		}
+		a.poolMu.Unlock()
+		if inUse {
+			continue
+		}
+		wasReady := account.Status == "ready"
+		refreshCtx, cancel := context.WithTimeout(ctx, accountRefreshTimeout)
+		refreshed, refreshErr := a.generator.Refresh(refreshCtx, account)
+		cancel()
+		a.poolMu.Lock()
+		if current, findErr := a.findAdminAccount(account.ID); findErr == nil {
+			account.Name, account.Enabled, account.RequestsPerMinute = current.Name, current.Enabled, current.RequestsPerMinute
+			refreshed.Name, refreshed.Enabled, refreshed.RequestsPerMinute = current.Name, current.Enabled, current.RequestsPerMinute
+		}
+		if refreshErr == nil {
+			if wasReady {
+				refreshed.Status = "ready"
 			}
-			for _, account := range accounts {
-				// 生成繁忙不能证明登录失效，仍按正常续期周期保留完整会话。
-				if !account.Enabled || time.Since(account.LastRefresh) < time.Duration(settings.RefreshMinutes)*time.Minute {
-					continue
-				}
-				// 访问令牌距过期大于 2 小时且风险会话未超过 4 小时时，无需高频轮换 IMS 会话。
-				tokenFresh := account.AccessToken != "" && account.UserID != "" && account.Status == "ready" && !account.ExpiresAt.IsZero() && time.Until(account.ExpiresAt) > 2*time.Hour
-				if tokenFresh && !arpSessionExpired(account.ARPSession, time.Now()) {
-					continue
-				}
-				a.poolMu.Lock()
-				if a.busy == nil {
-					a.busy = make(map[string]bool)
-				}
-				inUse := a.busy[account.ID] || a.activeByAccount[account.ID] > 0
-				if !inUse {
-					current, findErr := a.findAdminAccount(account.ID)
-					if findErr != nil || !current.Enabled {
-						a.poolMu.Unlock()
-						continue
-					}
-					account = current
-					a.busy[account.ID] = true
-				}
-				a.poolMu.Unlock()
-				if inUse {
-					continue
-				}
-				wasReady := account.Status == "ready"
-				refreshCtx, cancel := context.WithTimeout(ctx, accountRefreshTimeout)
-				refreshed, refreshErr := a.generator.Refresh(refreshCtx, account)
-				cancel()
-				a.poolMu.Lock()
-				if current, findErr := a.findAdminAccount(account.ID); findErr == nil {
-					account.Name, account.Enabled, account.RequestsPerMinute = current.Name, current.Enabled, current.RequestsPerMinute
-					refreshed.Name, refreshed.Enabled, refreshed.RequestsPerMinute = current.Name, current.Enabled, current.RequestsPerMinute
-				}
-				if refreshErr == nil {
-					if wasReady {
-						refreshed.Status = "ready"
-					}
-					_ = a.store.SaveAccount(refreshed)
-				} else if !tokenFresh {
-					account = mergeConfirmedRefresh(account, refreshed)
-					account.Status = "expired"
-					account.LastError = safeError(refreshErr)
-					account.LastRefresh = time.Now()
-					_ = a.store.SaveAccount(account)
-				}
-				delete(a.busy, account.ID)
-				a.poolMu.Unlock()
-				if ctx.Err() != nil {
-					return
-				}
+			_ = a.store.SaveAccount(refreshed)
+		} else {
+			// 无论旧令牌是否仍有效，都先保存本轮已确认的 Cookie 和令牌轮换。
+			account = mergeConfirmedRefresh(account, refreshed)
+			account.Status = "error"
+			if account.AccessToken == "" || account.ExpiresAt.IsZero() || !account.ExpiresAt.After(time.Now()) {
+				account.Status = "expired"
 			}
+			account.LastError = safeError(refreshErr)
+			account.LastRefresh = time.Now()
+			_ = a.store.SaveAccount(account)
+		}
+		delete(a.busy, account.ID)
+		a.poolMu.Unlock()
+		if ctx.Err() != nil {
+			return
 		}
 	}
 }

@@ -56,13 +56,22 @@ async function run(events, componentDelay = 0) {
   assert.equal(invalid.result,undefined,name);
   assert.equal(invalid.remainingObservers,0,name);
  }
- // 官方供应商允许对象格式，也允许仅部分供应商已产生凭据。
+ // 与后端保持一致，单个供应商或对象格式都不能提前结束采集。
  for(const value of [encode({sid:'测试会话编号',fpjs:{requestId:'测试请求编号'}}),encode({sid:'测试会话编号',bfp:'测试验证数据'})]){
-  const valid=await run([[0,value]]);
-  assert.equal(valid.error,undefined);
-  assert.equal(valid.result.arp_session,value);
-  assert.ok(valid.elapsed>=20000);
-  assert.equal(valid.remainingObservers,0);
+  const invalid=await run([[0,value]]);
+  assert.match(invalid.error?.message || '',/尚未完成初始化/);
+  assert.equal(invalid.result,undefined);
+  assert.equal(invalid.remainingObservers,0);
+ }
+ // 中间态即使稳定二十秒也须继续等齐所有供应商。
+ const staged=await run([[0,encode({sid:'测试会话编号',bfp:'测试验证数据'})],[35000,complete(10)]]);
+ assert.equal(staged.result.arp_session,complete(10));
+ assert.ok(staged.elapsed>=36500);
+ // 不透明供应商标记原样传递，不在页面端发明与官方不同的失效语义。
+ for(const ftr of ['fixture___','fixture__UDF9_13ck_tt','fixture__tt']){
+  const value=encode({sid:'测试会话编号',ftr,ark:'ark',bfp:'bfp'});
+  const opaque=await run([[0,value]]);
+  assert.equal(opaque.result.arp_session,value);
  }
  const periodic=await run([[0,initial],[1000,complete(1)],[5000,complete(2)],[10000,complete(3)],[15000,complete(4)],[20000,complete(5)],[25000,complete(6)]]);
  assert.equal(periodic.error,undefined);
@@ -80,5 +89,5 @@ async function run(events, componentDelay = 0) {
  assert.equal(slowPage.error,undefined);
  assert.equal(slowPage.result.arp_session,complete(8));
  assert.ok(slowPage.elapsed>=65000);
- console.log('浏览器会话初始化测试通过：异常格式拒绝、合法供应商对象、部分凭据、周期更新与稳定窗口');
+ console.log('浏览器会话初始化测试通过：异常格式拒绝、完整供应商凭据、中间状态等待、周期更新与稳定窗口');
 })().catch(error=>{console.error(error.message);process.exitCode=1;});

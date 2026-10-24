@@ -846,18 +846,19 @@ func (a *App) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	refreshBase := account
 	if refreshBase.Status == "error" && (strings.Contains(refreshBase.LastError, "408") || strings.Contains(refreshBase.LastError, "system under load")) {
-		refreshBase.ARPSession = ""
+		refreshBase.RiskRefreshRequired = true
 	}
 	updated, err := a.generator.Refresh(ctx, refreshBase)
 	if err != nil {
-		account = mergeConfirmedRefresh(account, updated)
+		account = mergeConfirmedRefresh(refreshBase, updated)
 		account.Status, account.LastError = "expired", safeError(err)
 		if errors.Is(err, context.DeadlineExceeded) {
 			account.LastError = "登录刷新超时，请稍后重试"
 		} else if errors.Is(err, context.Canceled) {
 			account.LastError = "登录刷新已取消"
 		}
-		_ = a.store.SaveAccount(account)
+		// 失败期间管理员仍可停用账号，凭据落盘不能把新的启用状态覆盖回去。
+		_ = a.saveGenerationAccount(account)
 		writeError(w, http.StatusBadGateway, account.LastError)
 		return
 	}

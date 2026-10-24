@@ -25,27 +25,29 @@ type Settings struct {
 
 // Account 的登录凭据仅用于访问 Adobe，列表接口会移除敏感字段。
 type Account struct {
-	ID             string    `json:"id"`
-	Name           string    `json:"name"`
-	Email          string    `json:"email"`
-	UserID         string    `json:"user_id,omitempty"`
-	Enabled        bool      `json:"enabled"`
-	Cookie         string    `json:"cookie,omitempty"`
-	AccessToken    string    `json:"access_token,omitempty"`
-	RefreshToken   string    `json:"refresh_token,omitempty"`
-	ClientID       string    `json:"client_id,omitempty"`
-	APIKey         string    `json:"api_key,omitempty"`
-	ARPSession     string    `json:"arp_session,omitempty"`
-	Nonce          string    `json:"nonce,omitempty"`
-	ExpiresAt      time.Time `json:"expires_at"`
-	LastRefresh    time.Time `json:"last_refresh"`
-	Status            string    `json:"status"`
-	LastError         string    `json:"last_error"`
-	Credits           *float64  `json:"credits"`
-	CreditsTotal      *float64  `json:"credits_total,omitempty"`
-	Plan              string    `json:"plan,omitempty"`
-	RequestsPerMinute int       `json:"requests_per_minute"`
-	BrowserProfile    string    `json:"browser_profile,omitempty"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Email        string `json:"email"`
+	UserID       string `json:"user_id,omitempty"`
+	Enabled      bool   `json:"enabled"`
+	Cookie       string `json:"cookie,omitempty"`
+	AccessToken  string `json:"access_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	ClientID     string `json:"client_id,omitempty"`
+	APIKey       string `json:"api_key,omitempty"`
+	ARPSession   string `json:"arp_session,omitempty"`
+	// 风险恢复意图独立于令牌有效期保存，防止旧 Cookie 回填后跳过浏览器重建。
+	RiskRefreshRequired bool      `json:"risk_refresh_required,omitempty"`
+	Nonce               string    `json:"nonce,omitempty"`
+	ExpiresAt           time.Time `json:"expires_at"`
+	LastRefresh         time.Time `json:"last_refresh"`
+	Status              string    `json:"status"`
+	LastError           string    `json:"last_error"`
+	Credits             *float64  `json:"credits"`
+	CreditsTotal        *float64  `json:"credits_total,omitempty"`
+	Plan                string    `json:"plan,omitempty"`
+	RequestsPerMinute   int       `json:"requests_per_minute"`
+	BrowserProfile      string    `json:"browser_profile,omitempty"`
 }
 
 // ImageRecord 只保存文件元信息，图片本体按需从磁盘读取。

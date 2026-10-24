@@ -44,11 +44,12 @@ const browserSessionScript = `(async () => {
     const encoded=value.replace(/-/g,'+').replace(/_/g,'/');
     const payload=JSON.parse(atob(encoded));
     if(!payload||typeof payload!=='object'||Array.isArray(payload)||typeof payload.sid!=='string'||!payload.sid.trim())return false;
-    // 官方供应商数据允许字符串或对象，至少有一份有效数据才继续读取会话。
-    return ['ftr','ark','bfp','fpjs'].some(key=>{
-     const token=payload[key];
-     return typeof token==='string'?Boolean(token.trim()):token!==null&&typeof token==='object'&&!Array.isArray(token)&&Object.keys(token).length>0;
-    });
+    // 与服务端就绪条件一致，不能把只有单个供应商的中间状态当作完成。
+    if(!['ftr','ark','bfp'].every(key=>typeof payload[key]==='string'&&payload[key].trim()))return false;
+    const ftr=payload.ftr;
+    // 供应商内部标记不是公开的有效性协议，完整原值交由上游验证，不按字符串猜测失效。
+    const timestamp=Number(ftr.split('_')[1]);
+    return !(timestamp>1700000000000&&Date.now()-timestamp>=4*60*60*1000);
    }catch{return false}
   };
   const finish = error => {
@@ -120,6 +121,10 @@ func (a *App) refreshBrowser(ctx context.Context, account Account) (Account, err
 	ctx, cancel := context.WithTimeout(ctx, accountRefreshTimeout)
 	defer cancel()
 	endpoint := browserEndpointForAccount(account, os.Getenv("ADOBE2API_CDP_URL"))
+	if account.RiskRefreshRequired {
+		// 风险拒绝后使用独立会话，不能从已连接页面再次读回同一个旧值。
+		endpoint = ""
+	}
 	updated, err := a.refreshBrowserSession(ctx, account, endpoint)
 	if err != nil && endpoint != "" && account.Cookie != "" && ctx.Err() == nil {
 		// 当前登录页可能是池内另一个账号，失败时改用本账号 Cookie 独立续期。
@@ -142,6 +147,9 @@ func validateBrowserSession(account Account, session browserSession) error {
 	}
 	if account.UserID != "" && account.UserID != session.Profile.UserID {
 		return errors.New("浏览器登录账号与账号池记录不一致")
+	}
+	if arpSessionExpired(session.ARPSession, time.Now()) {
+		return errors.New("Adobe 风险会话尚未完成初始化，请重新同步")
 	}
 	return nil
 }
@@ -216,19 +224,19 @@ func (a *App) refreshBrowserSession(ctx context.Context, account Account, endpoi
 		}
 		request := &http.Request{Header: http.Header{"Cookie": []string{account.Cookie}}}
 		skipCookies := map[string]bool{
-			"OptanonConsent":                                 true,
-			"OptanonAlertBoxClosed":                          true,
+			"OptanonConsent":        true,
+			"OptanonAlertBoxClosed": true,
 			"kndctr_9E1005A551ED61CA0A490D45_AdobeOrg_consent": true,
-			"edge_geo_country":                               true,
-			"sherlockToken":                                  true,
-			"forter":                                         true,
-			"forterToken":                                    true,
-			"ftrset":                                         true,
-			"ftr_ncd":                                        true,
-			"ftr_blst_1h":                                    true,
-			"arkose":                                         true,
-			"bfp":                                            true,
-			"ff_session_guid":                                true,
+			"edge_geo_country": true,
+			"sherlockToken":    true,
+			"forter":           true,
+			"forterToken":      true,
+			"ftrset":           true,
+			"ftr_ncd":          true,
+			"ftr_blst_1h":      true,
+			"arkose":           true,
+			"bfp":              true,
+			"ff_session_guid":  true,
 		}
 		// 原始 Cookie 文本没有域信息，将 Adobe SSO Cookie 写入其实际认证域（过滤隐私拦截与过期风险 Cookie 以生成全新风险凭据）。
 		for _, cookie := range request.Cookies() {

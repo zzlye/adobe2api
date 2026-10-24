@@ -111,7 +111,7 @@ func TestExplicitUpstreamLogOverridesContextWithoutDuplicate(t *testing.T) {
 	}
 }
 
-func TestARPSessionExpiryAndAutoRetryOn408(t *testing.T) {
+func TestARPSessionExpiryAndOpaqueVendorMarkers(t *testing.T) {
 	now := time.UnixMilli(1792778000000)
 	makeARP := func(ftr string, withAll bool) string {
 		payload := map[string]string{"sid": "sid-1", "ftr": ftr}
@@ -129,8 +129,10 @@ func TestARPSessionExpiryAndAutoRetryOn408(t *testing.T) {
 	if arpSessionExpired(freshARP, now) {
 		t.Fatal("未满 4 小时的完整风险会话被误判为过期")
 	}
-	if !arpSessionExpired(expiredARP, now) || !arpSessionExpired(incompleteARP, now) || !arpSessionExpired(udf9ARP, now) {
-		t.Fatal("已超时、缺字段或降级为 UDF9 的风险会话未被识别为需要刷新")
+	if !arpSessionExpired(expiredARP, now) || !arpSessionExpired(incompleteARP, now) {
+		t.Fatal("已超过维护窗口或缺字段的风险会话未被识别为需要刷新")
+	}
+	if arpSessionExpired(udf9ARP, now) {
+		t.Fatal("不透明的供应商标记不能被本地擅自判定为失效")
 	}
 }
-

@@ -51,6 +51,8 @@ type UpstreamError struct {
 	Message    string
 	// AccessError 保留脱敏后的权限原因，区分模型无权限与登录失效。
 	AccessError string
+	// RetrySafe 仅在首个生成提交被明确拒绝、尚无已接受任务时设置。
+	RetrySafe bool
 }
 
 func (e *UpstreamError) Error() string {
@@ -737,6 +739,13 @@ func (g *AdobeGenerator) Generate(ctx context.Context, account Account, input Ge
 		}
 		payload, err := decodeAdobeResponse(response)
 		if err != nil {
+			var upstream *UpstreamError
+			status := strings.ToUpper(response.Header.Get("X-Task-Status"))
+			// 即使状态码表示失败，只要同时给出任务或输出，也按已接受处理，避免歧义响应重复计费。
+			accepted := len(payload.Links) > 0 || len(payload.Outputs) > 0 || response.Header.Get("X-Override-Status-Link") != "" || response.Header.Get("Location") != "" || status == "ACCEPTED" || status == "IN_PROGRESS" || status == "COMPLETED"
+			if index == 0 && !accepted && errors.As(err, &upstream) && (upstream.StatusCode == http.StatusUnauthorized || upstream.StatusCode == http.StatusRequestTimeout && upstream.Code == "timeout_error") {
+				upstream.RetrySafe = true
+			}
 			return result, err
 		}
 		payload, err = g.poll(ctx, client, account, response.Header, payload, log)
@@ -882,7 +891,7 @@ func (g *AdobeGenerator) Refresh(ctx context.Context, account Account) (updated 
 		}
 	}()
 	updated, err = g.refreshIMS(ctx, account)
-	if err == nil && !arpSessionExpired(updated.ARPSession, time.Now()) {
+	if err == nil && !account.RiskRefreshRequired && !arpSessionExpired(updated.ARPSession, time.Now()) {
 		return updated, nil
 	}
 	if ctx.Err() != nil {
@@ -914,8 +923,11 @@ func (g *AdobeGenerator) Refresh(ctx context.Context, account Account) (updated 
 	if browsed.UserID == "" {
 		browsed.UserID = expectedUserID
 	}
-	if browsed.ARPSession == "" {
+	if arpSessionExpired(browsed.ARPSession, time.Now()) {
 		return browserAccount, errors.New("浏览器没有返回 Adobe 风险会话，请重新同步登录状态")
+	}
+	if account.RiskRefreshRequired && browsed.ARPSession == account.ARPSession {
+		return browserAccount, errors.New("浏览器仍返回此前被拒绝的风险会话，请重新同步登录状态")
 	}
 	// 浏览器缓存的令牌可能属于其他权限范围，完成 Cookie 和风险会话后再次由 IMS 规范化。
 	refreshed, refreshErr := g.refreshIMS(ctx, browsed)
@@ -923,6 +935,7 @@ func (g *AdobeGenerator) Refresh(ctx context.Context, account Account) (updated 
 		// 最后一次 IMS 未确认页面凭据时，只返回前一次已确认的会话供失败分支保存。
 		return browserAccount, refreshErr
 	}
+	refreshed.RiskRefreshRequired = false
 	return refreshed, nil
 }
 
@@ -1049,7 +1062,7 @@ func mergeAdobeCookies(raw string, incoming []*http.Cookie) string {
 	return strings.Join(pairs, "; ")
 }
 
-// arpSessionExpired 判断风险会话是否缺失、未完成四项供应商采集或已超过 4 小时有效期（避免满 7 小时后触发上游 408）。
+// arpSessionExpired 检查采集完整性及保守的四小时维护窗口，不猜测供应商内部标记的含义。
 func arpSessionExpired(raw string, now time.Time) bool {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -1077,7 +1090,7 @@ func arpSessionExpired(raw string, now time.Time) bool {
 	ftr, _ := payload["ftr"].(string)
 	ark, _ := payload["ark"].(string)
 	bfp, _ := payload["bfp"].(string)
-	if ftr == "" || ark == "" || bfp == "" || strings.Contains(ftr, "___") || strings.HasSuffix(ftr, "__tt") || strings.Contains(ftr, "__UDF9") {
+	if strings.TrimSpace(ftr) == "" || strings.TrimSpace(ark) == "" || strings.TrimSpace(bfp) == "" {
 		return true
 	}
 	parts := strings.Split(ftr, "_")
